@@ -14,6 +14,9 @@
     "icons": "node tools/make-icons.mjs"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
   }
 }
