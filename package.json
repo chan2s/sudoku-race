@@ -1,0 +1,19 @@
+{
+  "name": "sudoku-offline-first",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Offline-first competitive Sudoku (HTML + CSS + vanilla JS) with an optional authoritative WebSocket multiplayer service.",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node tools/test-sudoku.mjs && node tools/test-multiplayer.mjs && node tools/test-standalone.mjs",
+    "test:logic": "node tools/test-sudoku.mjs",
+    "test:multiplayer": "node tools/test-multiplayer.mjs",
+    "test:standalone": "node tools/test-standalone.mjs",
+    "smoke": "node tools/browser-smoke.mjs",
+    "icons": "node tools/make-icons.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

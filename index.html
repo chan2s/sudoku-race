@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Sudoku — Beat the Clock</title>
+    <meta
+      name="description"
+      content="Offline-first competitive Sudoku with single player and real-time multiplayer races."
+    />
+    <meta name="theme-color" content="#0b1220" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="assets/icon-192.png" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <p id="sr-status" class="sr-only" role="status" aria-live="polite"></p>
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+      <main class="screens">
+        <!-- ── Home ─────────────────────────────────────────────── -->
+        <section
+          id="screen-home"
+          class="screen screen-home"
+          data-screen="home"
+          aria-labelledby="home-title"
+        >
+          <h1 id="home-title" class="logo">SUDOKU</h1>
+          <p class="tagline">Beat the clock.</p>
+          <nav class="menu" aria-label="Main menu">
+            <button class="btn btn-primary btn-lg" type="button" data-action="go-difficulty">
+              Single Player
+            </button>
+            <button class="btn btn-lg" type="button" data-action="go-multiplayer">
+              Multiplayer
+            </button>
+            <button class="btn" type="button" data-action="go-stats">Statistics</button>
+            <button class="btn" type="button" data-action="go-settings">Settings</button>
+          </nav>
+          <p class="resume" id="home-resume" hidden>
+            <span class="muted">Unfinished game</span>
+            <button class="btn btn-sm" type="button" data-action="resume-game">
+              Continue <span id="home-resume-meta"></span>
+            </button>
+          </p>
+        </section>
+
+        <!-- ── Difficulty picker ────────────────────────────────── -->
+        <section id="screen-difficulty" class="screen" data-screen="difficulty" hidden>
+          <header class="screen-header">
+            <button class="btn btn-ghost" type="button" data-action="go-home">← Back</button>
+            <h2>Single Player</h2>
+            <span class="header-spacer" aria-hidden="true"></span>
+          </header>
+          <div id="difficulty-list" class="difficulty-list"></div>
+          <p class="muted small">
+            Puzzles are generated on your device and work completely offline.
+          </p>
+        </section>
+
+        <!-- ── Game ─────────────────────────────────────────────── -->
+        <section id="screen-game" class="screen screen-game" data-screen="game" hidden>
+          <header class="game-header">
+            <button class="btn btn-ghost" type="button" data-action="quit-game" aria-label="Quit game">
+              ✕
+            </button>
+            <div class="game-meta">
+              <span id="game-difficulty" class="pill">Easy</span>
+              <span id="game-mistakes" class="pill pill-danger" hidden>Mistakes 0/3</span>
+            </div>
+            <div class="timer-block">
+              <span class="timer-label">TIME</span>
+              <span id="game-timer" class="timer" aria-live="off">00:00</span>
+            </div>
+          </header>
+
+          <div id="mp-hud" class="mp-hud" hidden>
+            <div class="mp-player" id="mp-you">
+              <span class="mp-name">YOU</span>
+              <span id="mp-you-time" class="timer">00:00</span>
+              <div class="progress" role="img" aria-label="Your progress">
+                <div id="mp-you-bar" class="progress-bar"></div>
+              </div>
+              <span id="mp-you-status" class="mp-status">● Solving</span>
+            </div>
+            <div class="mp-player" id="mp-opponent">
+              <span class="mp-name" id="mp-opponent-name">OPPONENT</span>
+              <span id="mp-opp-time" class="timer">00:00</span>
+              <div class="progress" role="img" aria-label="Opponent progress">
+                <div id="mp-opp-bar" class="progress-bar"></div>
+              </div>
+              <span id="mp-opp-status" class="mp-status">● Solving</span>
+            </div>
+          </div>
+
+          <div class="board-wrap">
+            <div id="board" class="board" role="grid" aria-label="Sudoku board"></div>
+            <div id="board-overlay" class="board-overlay" hidden>
+              <div class="overlay-card">
+                <h3 id="overlay-title">Paused</h3>
+                <p id="overlay-text"></p>
+                <div id="overlay-actions" class="overlay-actions"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="numpad" class="numpad" role="group" aria-label="Number pad"></div>
+
+          <div class="controls">
+            <button class="btn" type="button" data-action="undo" aria-label="Undo last move">
+              ↺ Undo
+            </button>
+            <button class="btn" type="button" data-action="erase" aria-label="Erase cell">
+              ⌫ Erase
+            </button>
+            <button class="btn" type="button" data-action="pause" aria-label="Pause game">
+              ⏸ Pause
+            </button>
+          </div>
+        </section>
+
+        <!-- ── Multiplayer ──────────────────────────────────────── -->
+        <section id="screen-multiplayer" class="screen" data-screen="multiplayer" hidden>
+          <header class="screen-header">
+            <button class="btn btn-ghost" type="button" data-action="go-home">← Back</button>
+            <h2>Multiplayer</h2>
+            <span class="header-spacer" aria-hidden="true"></span>
+          </header>
+
+          <p id="mp-connection" class="mp-connection"><span class="dot"></span> Connecting…</p>
+
+          <div id="mp-connect" class="panel">
+            <label class="field">
+              <span>Your name</span>
+              <input id="mp-name" type="text" maxlength="18" autocomplete="nickname" placeholder="Player" />
+            </label>
+            <div class="panel-actions panel-actions-split">
+              <label class="field">
+                <span>Difficulty</span>
+                <select id="mp-difficulty">
+                  <option value="easy">Easy</option>
+                  <option value="medium" selected>Medium</option>
+                  <option value="hard">Hard</option>
+                  <option value="expert">Expert</option>
+                </select>
+              </label>
+              <button class="btn btn-primary" type="button" data-action="create-room">
+                Create room
+              </button>
+            </div>
+            <form id="mp-join-form" class="join-form" novalidate>
+              <label class="field">
+                <span>Room code</span>
+                <input
+                  id="mp-room-code"
+                  type="text"
+                  maxlength="6"
+                  placeholder="X7K92"
+                  autocapitalize="characters"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
+              <button class="btn" type="submit">Join room</button>
+            </form>
+            <p id="mp-error" class="error" role="alert" hidden></p>
+            <p class="muted small">
+              Multiplayer needs a connection to the game server. Single player always works offline.
+            </p>
+          </div>
+
+          <div id="mp-room" class="panel" hidden>
+            <p class="room-code">
+              ROOM: <strong id="mp-room-id">-----</strong>
+              <button class="btn btn-sm btn-ghost" type="button" data-action="copy-room">
+                Copy code
+              </button>
+            </p>
+            <ul id="mp-players" class="players"></ul>
+            <p id="mp-room-hint" class="muted small"></p>
+            <div class="panel-actions">
+              <button class="btn btn-primary" id="mp-ready" type="button" data-action="toggle-ready">
+                I’m ready
+              </button>
+              <button class="btn" id="mp-start" type="button" data-action="start-game" hidden>
+                Start game
+              </button>
+              <button class="btn btn-ghost" type="button" data-action="leave-room">Leave room</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── Statistics ───────────────────────────────────────── -->
+        <section id="screen-stats" class="screen" data-screen="stats" hidden>
+          <header class="screen-header">
+            <button class="btn btn-ghost" type="button" data-action="go-home">← Back</button>
+            <h2>Statistics</h2>
+            <span class="header-spacer" aria-hidden="true"></span>
+          </header>
+          <div id="stats-content" class="stats"></div>
+        </section>
+
+        <!-- ── Settings ─────────────────────────────────────────── -->
+        <section id="screen-settings" class="screen" data-screen="settings" hidden>
+          <header class="screen-header">
+            <button class="btn btn-ghost" type="button" data-action="go-home">← Back</button>
+            <h2>Settings</h2>
+            <span class="header-spacer" aria-hidden="true"></span>
+          </header>
+          <div class="settings">
+            <label class="field">
+              <span>Player name</span>
+              <input id="set-name" type="text" maxlength="18" autocomplete="nickname" />
+            </label>
+            <label class="field">
+              <span>Mistake limit <em>(0 = unlimited)</em></span>
+              <input id="set-mistakes" type="number" min="0" max="10" step="1" inputmode="numeric" />
+            </label>
+            <label class="switch">
+              <input id="set-duplicates" type="checkbox" />
+              <span>Highlight duplicate numbers</span>
+            </label>
+            <label class="switch">
+              <span>Sound &amp; vibration on completion</span>
+              <input id="set-haptics" type="checkbox" />
+            </label>
+            <label class="field">
+              <span>Multiplayer server URL</span>
+              <input id="set-mp-url" type="text" placeholder="ws://localhost:8787/ws" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>Sync endpoint</span>
+              <input id="set-sync-endpoint" type="text" placeholder="/api/sync" spellcheck="false" />
+            </label>
+            <div class="panel-actions">
+              <button class="btn btn-primary" type="button" data-action="save-settings">Save</button>
+              <button class="btn" type="button" data-action="export-data">Export data</button>
+              <button class="btn btn-danger" type="button" data-action="clear-data">Clear local data</button>
+            </div>
+            <p id="settings-storage" class="muted small"></p>
+            <p class="muted small">
+              Local storage: <span id="settings-backend">checking…</span> ·
+              <span id="settings-pending">0</span> change(s) waiting to sync
+            </p>
+          </div>
+        </section>
+      </main>
+
+      <footer class="status-bar">
+        <span id="status-indicator" class="status-indicator"><span class="dot"></span> Online</span>
+        <span id="sync-status" class="sync-status"></span>
+        <span id="install-hint" class="install-hint" hidden>
+          <button class="btn btn-sm btn-ghost" type="button" data-action="install">
+            Install app
+          </button>
+        </span>
+      </footer>
+    </div>
+
+    <noscript>
+      <p style="padding: 2rem; color: #e2e8f0; background: #0b1220">
+        Sudoku needs JavaScript enabled to run.
+      </p>
+    </noscript>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
