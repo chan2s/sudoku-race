@@ -36,6 +36,7 @@ export class UI {
     this.connection = { state: CONNECTION_STATE.IDLE, message: '' };
     this.opponent = { name: 'OPPONENT', progress: 0, timeMs: 0, done: false, away: false, left: false };
     this.you = { progress: 0, done: false, timeMs: 0 };
+    this.disconnectCountdown = null; // { name, deadline, serverNow } while the opponent is away
     this.serverOffsetMs = 0;
     this.currentScreen = 'home';
     this.cells = [];
@@ -65,6 +66,9 @@ export class UI {
       mpYouStatus: $('mp-you-status'),
       mpOppStatus: $('mp-opp-status'),
       mpOppName: $('mp-opponent-name'),
+      mpDisconnect: $('mp-disconnect'),
+      mpDisconnectName: $('mp-disconnect-name'),
+      mpDisconnectCount: $('mp-disconnect-count'),
       statusIndicator: $('status-indicator'),
       syncStatus: $('sync-status'),
       srStatus: $('sr-status'),
@@ -739,6 +743,39 @@ export class UI {
     this.renderMultiplayerHud();
   }
 
+  /* --------------------- opponent disconnect banner ---------------- */
+
+  /**
+   * Shows the reconnection countdown. `deadline` is a server timestamp and
+   * `serverNow` the client's best estimate of server time, so the remaining
+   * time is authoritative even when the device clock is off.
+   */
+  showDisconnectCountdown({ name, deadline, serverNow } = {}) {
+    if (!Number.isFinite(Number(deadline)) || Number(deadline) <= 0) return;
+    this.disconnectCountdown = {
+      name: name || 'Opponent',
+      deadline: Number(deadline),
+      serverNow: typeof serverNow === 'function' ? serverNow : () => Date.now(),
+    };
+    if (this.elements.mpDisconnectName) this.elements.mpDisconnectName.textContent = this.disconnectCountdown.name;
+    if (this.elements.mpDisconnect) this.elements.mpDisconnect.hidden = false;
+    this.renderDisconnectCountdown();
+  }
+
+  hideDisconnectCountdown() {
+    this.disconnectCountdown = null;
+    if (this.elements.mpDisconnect) this.elements.mpDisconnect.hidden = true;
+  }
+
+  /** Ticks the visible reconnection countdown; clamps at 00:00. */
+  renderDisconnectCountdown() {
+    const countdown = this.disconnectCountdown;
+    const element = this.elements.mpDisconnectCount;
+    if (!countdown || !element) return;
+    const remaining = Math.max(0, countdown.deadline - countdown.serverNow());
+    element.textContent = formatTime(remaining);
+  }
+
   setYou({ progress, done, finalMs } = {}) {
     if (progress !== undefined) this.you.progress = progress;
     if (done !== undefined) this.you.done = done;
@@ -750,16 +787,23 @@ export class UI {
   resetOpponent() {
     this.opponent = { name: 'OPPONENT', progress: 0, timeMs: 0, done: false, away: false, left: false };
     this.you = { progress: 0, done: false, timeMs: 0 };
+    this.hideDisconnectCountdown();
     this.renderMultiplayerHud();
   }
 
-  showResult({ winnerId, youId, results = [], reason = '' }) {
+  showResult({ winnerId, youId, results = [], reason = '', resultReason = '', abandonedPlayerId = null }) {
     const youWon = winnerId && winnerId === youId;
     const draw = !winnerId;
-    const describe = (result) =>
-      `${result.name || 'Player'} — ${
+    const byAbandonment = resultReason === 'OPPONENT_ABANDONED' || resultReason === 'PLAYER_ABANDONED';
+    const describe = (result) => {
+      if (byAbandonment && !result.completed) {
+        const lost = result.playerId && result.playerId === abandonedPlayerId;
+        return `${result.name || 'Player'} — ${lost ? 'abandoned' : 'did not finish'}`;
+      }
+      return `${result.name || 'Player'} — ${
         result.valid === false ? 'invalid board' : formatTime(result.elapsedMs || 0)
       }`;
+    };
     const lines = results.map(describe).join('  ·  ');
     this.showOverlay({
       title: draw ? 'Race finished' : youWon ? 'You win! 🏆' : 'You lost this time',

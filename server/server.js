@@ -15,9 +15,9 @@
  */
 
 import http from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { extname, join, normalize, resolve } from 'node:path';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { generatePuzzle, isValidSolution } from '../js/sudoku.js';
@@ -30,10 +30,30 @@ const PORT = Number(process.env.PORT) || 8787;
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusable characters
 const ROOM_TTL_MS = 15 * 60 * 1000;
 const DISCONNECT_GRACE_MS = 3 * 60 * 1000;
+// How long a mid-race disconnected player may come back before the server
+// awards the race to their opponent. Overridable for tests only; production
+// default is the specified 10 minutes.
+const RECONNECT_TIMEOUT_MS = Number(process.env.RECONNECT_TIMEOUT_MS) || 10 * 60 * 1000;
+// How often the deadline sweeper re-checks every room. The per-player timeout
+// is the prompt path; this sweep is the recovery path so the rule still fires
+// if a timer was lost (event-loop stall, restart-restore, timer drift).
+const ABANDONMENT_SWEEP_MS = Number(process.env.ABANDONMENT_SWEEP_MS) || 5000;
+// Where room state is persisted so deadlines survive a server restart.
+const ROOMS_FILE = process.env.ROOMS_FILE || join(HERE, 'data', 'rooms.json');
+const PERSIST_DEBOUNCE_MS = 250;
 const MAX_ROOM_PLAYERS = 2;
 const MAX_MESSAGES_PER_WINDOW = 120;
 const RATE_WINDOW_MS = 1000;
 const MAX_SYNC_RECORDS = 5000;
+
+/** Result vocabulary — `resultReason` travels with every finished race. */
+const RESULT_REASONS = {
+  PUZZLE_COMPLETED: 'PUZZLE_COMPLETED',
+  OPPONENT_ABANDONED: 'OPPONENT_ABANDONED',
+  PLAYER_ABANDONED: 'PLAYER_ABANDONED',
+  DRAW: 'DRAW',
+  SERVER_CANCELLED: 'SERVER_CANCELLED',
+};
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -93,6 +113,160 @@ function send(socket, message) {
 /** roomId → room */
 const rooms = new Map();
 
+/* ----------------------------- persistence ------------------------------ */
+/*
+ * Room state (including every player's disconnectedAt / reconnectDeadline) is
+ * mirrored to disk so the abandonment rule survives a restart: on boot the
+ * stored deadlines are re-armed and anything that expired while the process
+ * was down is finalised by the first sweep. Only the WebSocket handles are
+ * transient — every competitive fact is in the file.
+ */
+
+let persistTimer = null;
+let persisting = false;
+
+function serializeRoom(room) {
+  return {
+    id: room.id,
+    code: room.code,
+    difficulty: room.difficulty,
+    clues: room.clues,
+    seed: room.seed,
+    puzzleId: room.puzzleId,
+    solution: room.solution,
+    puzzle: room.puzzle,
+    hostId: room.hostId,
+    status: room.status,
+    createdAt: room.createdAt,
+    lastActivity: room.lastActivity,
+    startedAt: room.startedAt,
+    finishedAt: room.finishedAt,
+    winnerId: room.winnerId,
+    finishReason: room.finishReason,
+    resultReason: room.resultReason,
+    abandonedPlayerId: room.abandonedPlayerId,
+    results: room.results,
+    players: Array.from(room.players.values()).map((player) => ({
+      id: player.id,
+      name: player.name,
+      ready: player.ready,
+      connected: player.connected,
+      completed: player.completed,
+      completedAt: player.completedAt,
+      elapsedMs: player.elapsedMs,
+      disconnectedAt: player.disconnectedAt,
+      reconnectDeadline: player.reconnectDeadline,
+      progress: Array.from(player.progress.entries()),
+    })),
+  };
+}
+
+function serializeRooms() {
+  return JSON.stringify({ savedAt: now(), rooms: Array.from(rooms.values()).map(serializeRoom) });
+}
+
+async function persistRooms() {
+  if (persisting) return;
+  persisting = true;
+  try {
+    await mkdir(dirname(ROOMS_FILE), { recursive: true });
+    const payload = serializeRooms();
+    // Write-then-rename so a crash mid-write cannot corrupt the previous state.
+    const tmp = `${ROOMS_FILE}.tmp`;
+    await writeFile(tmp, payload, 'utf8');
+    await rename(tmp, ROOMS_FILE);
+  } catch (error) {
+    console.warn('[server] could not persist room state', error.message);
+  } finally {
+    persisting = false;
+  }
+}
+
+/** Debounced persist for high-frequency paths. */
+function schedulePersist() {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    persistRooms();
+  }, PERSIST_DEBOUNCE_MS);
+  if (persistTimer.unref) persistTimer.unref();
+}
+
+/** Synchronous persist for shutdown paths. */
+function flushPersist() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  try {
+    mkdirSync(dirname(ROOMS_FILE), { recursive: true });
+    writeFileSync(ROOMS_FILE, serializeRooms(), 'utf8');
+  } catch (error) {
+    console.warn('[server] could not flush room state', error.message);
+  }
+}
+
+/** Rebuilds live room objects from disk and re-arms every stored deadline. */
+async function loadRooms() {
+  if (!existsSync(ROOMS_FILE)) return;
+  let raw;
+  try {
+    raw = await readFile(ROOMS_FILE, 'utf8');
+  } catch (error) {
+    console.warn('[server] could not read persisted room state', error.message);
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (error) {
+    console.warn('[server] persisted room state is corrupt — starting clean', error.message);
+    return;
+  }
+  const boot = now();
+  for (const stored of data.rooms || []) {
+    try {
+      const room = {
+        ...stored,
+        players: new Map(),
+      };
+      for (const storedPlayer of stored.players || []) {
+        const player = {
+          ...storedPlayer,
+          progress: new Map(storedPlayer.progress || []),
+          socket: null,
+          disconnectTimer: null,
+        };
+        if (player.connected) {
+          // The socket is gone after a restart: everyone gets a fresh window,
+          // except players who were already mid-window when state was saved —
+          // their stored deadline carries over untouched.
+          player.connected = false;
+          if (!player.reconnectDeadline) {
+            player.disconnectedAt = boot;
+            player.reconnectDeadline = boot + RECONNECT_TIMEOUT_MS;
+          }
+        }
+        room.players.set(player.id, player);
+      }
+      rooms.set(room.id, room);
+    } catch (error) {
+      console.warn(`[server] could not restore room ${stored.id}`, error.message);
+    }
+  }
+  // Finalise anything that expired while the server was down. The sweep keeps
+  // running afterwards; this pass just closes the gap immediately.
+  for (const room of rooms.values()) {
+    for (const player of room.players.values()) {
+      checkAbandonment(room, player);
+    }
+  }
+  if (rooms.size) {
+    console.log(`[server] restored ${rooms.size} room(s) from disk`);
+    persistRooms();
+  }
+}
+
 function createRoom(playerId, name, difficulty) {
   const code = makeRoomCode(rooms);
   const { puzzle, solution, difficulty: level, seed, clues } = generatePuzzle(difficulty);
@@ -113,10 +287,13 @@ function createRoom(playerId, name, difficulty) {
     finishedAt: null,
     winnerId: null,
     finishReason: null,
+    resultReason: null,
+    abandonedPlayerId: null,
     results: null,
     players: new Map(),
   };
   rooms.set(code, room);
+  schedulePersist();
   return room;
 }
 
@@ -130,11 +307,14 @@ function addPlayer(room, { id, name, socket }) {
     completedAt: null,
     elapsedMs: null,
     disconnectedAt: null,
+    reconnectDeadline: null,
+    disconnectTimer: null,
     progress: new Map(),
     socket,
   };
   room.players.set(id, player);
   room.lastActivity = now();
+  schedulePersist();
   return player;
 }
 
@@ -158,6 +338,8 @@ function roomSnapshot(room) {
       connected: player.connected,
       completed: player.completed,
       elapsedMs: player.elapsedMs,
+      disconnectedAt: player.disconnectedAt,
+      reconnectDeadline: player.reconnectDeadline,
     })),
   };
 }
@@ -176,6 +358,8 @@ function resultSnapshot(room) {
   return {
     results: room.results,
     reason: room.finishReason || 'Race finished',
+    resultReason: room.resultReason || RESULT_REASONS.PUZZLE_COMPLETED,
+    abandonedPlayerId: room.abandonedPlayerId ?? null,
     finishedAt: room.finishedAt,
   };
 }
@@ -209,6 +393,8 @@ function resetForRematch(room) {
   room.winnerId = null;
   room.results = null;
   room.finishReason = null;
+  room.resultReason = null;
+  room.abandonedPlayerId = null;
   room.finishedAt = null;
   room.startedAt = null;
   for (const player of room.players.values()) {
@@ -239,6 +425,8 @@ function startGame(room) {
   room.winnerId = null;
   room.results = null;
   room.finishReason = null;
+  room.resultReason = null;
+  room.abandonedPlayerId = null;
   for (const player of room.players.values()) {
     player.ready = false;
     player.completed = false;
@@ -257,6 +445,7 @@ function startGame(room) {
     send(player.socket, { type: MP.PROGRESS_STATE, progress: progressSnapshot(room) });
   }
   broadcastRoomState(room);
+  schedulePersist();
   console.log(`[server] room ${room.id} race started (seed ${room.seed}, ${room.difficulty})`);
   return true;
 }
@@ -264,10 +453,7 @@ function startGame(room) {
 /** Server decides everything here — the client only reports its board. */
 function handleCompletion(room, player, message) {
   const errors = [];
-  if (room.status === 'lobby') errors.push('game is not running');
-  if (room.finishReason && room.finishReason.startsWith('Opponent left')) {
-    errors.push('race already decided');
-  }
+  if (room.status !== 'playing') errors.push('game is not running');
   if (player.completed) errors.push('already completed');
   if (message.puzzleId && message.puzzleId !== room.puzzleId) errors.push('puzzle id mismatch');
   const board = Array.isArray(message.board) ? message.board : null;
@@ -298,6 +484,7 @@ function handleCompletion(room, player, message) {
   player.completedAt = completedAt;
   player.elapsedMs = completedAt - room.startedAt;
   room.lastActivity = completedAt;
+  schedulePersist();
 
   broadcast(
     room,
@@ -322,19 +509,28 @@ function handleCompletion(room, player, message) {
   }
 }
 
-function finishGame(room, reason) {
+function finishGame(room, reason, { resultReason = RESULT_REASONS.PUZZLE_COMPLETED, abandonedPlayerId = null } = {}) {
+  room.resultReason = resultReason;
+  room.abandonedPlayerId = abandonedPlayerId;
   if (room.status === 'finished' && room.results) {
     room.results = buildResults(room);
     room.finishReason = reason;
     broadcast(room, { type: MP.GAME_FINISHED, ...roomResultsMessage(room, reason) });
+    if (resultReason === RESULT_REASONS.OPPONENT_ABANDONED) broadcastGameEnded(room);
+    schedulePersist();
     return;
   }
   room.status = 'finished';
   room.finishedAt = now();
   room.finishReason = reason;
   room.results = buildResults(room);
+  for (const player of room.players.values()) clearDisconnectTimer(player);
   broadcast(room, { type: MP.GAME_FINISHED, ...roomResultsMessage(room, reason) });
-  console.log(`[server] room ${room.id} finished. winner=${room.winnerId}`);
+  if (resultReason === RESULT_REASONS.OPPONENT_ABANDONED || resultReason === RESULT_REASONS.PLAYER_ABANDONED) {
+    broadcastGameEnded(room);
+  }
+  schedulePersist();
+  console.log(`[server] room ${room.id} finished. winner=${room.winnerId} reason=${resultReason}`);
 }
 
 function buildResults(room) {
@@ -356,6 +552,8 @@ function roomResultsMessage(room, reason) {
     winnerId: room.winnerId,
     finishedAt: room.finishedAt,
     reason,
+    resultReason: room.resultReason || RESULT_REASONS.PUZZLE_COMPLETED,
+    abandonedPlayerId: room.abandonedPlayerId ?? null,
     results: room.results,
   };
 }
@@ -368,28 +566,110 @@ function playerPublic(player) {
     connected: player.connected,
     completed: player.completed,
     elapsedMs: player.elapsedMs,
+    disconnectedAt: player.disconnectedAt,
+    reconnectDeadline: player.reconnectDeadline,
   };
 }
 
-function removePlayer(room, playerId, { keepGrace = false } = {}) {
-  const player = room.players.get(playerId);
-  if (!player) return;
+/**
+ * The disconnect grace window: a dropped socket during a race starts a
+ * server-owned countdown instead of ending the game. The deadline lives in the
+ * room state (and on disk) so it survives timers being lost or the process
+ * restarting; the timeout handle is only an optimisation for promptness.
+ */
+function markDisconnected(room, player) {
+  clearDisconnectTimer(player);
   player.connected = false;
   player.disconnectedAt = now();
+  player.reconnectDeadline = player.disconnectedAt + RECONNECT_TIMEOUT_MS;
   player.socket = null;
-  room.lastActivity = now();
-  broadcast(room, { type: MP.PLAYER_DISCONNECTED, player: playerPublic(player) });
+  room.lastActivity = player.disconnectedAt;
+  schedulePersist();
 
-  if (room.status === 'playing' && !keepGrace) {
-    // The opponent is gone for good: award the race to the remaining player.
-    const remaining = Array.from(room.players.values()).find((other) => other.id !== playerId && other.connected);
-    if (remaining && !remaining.completed) {
-      room.winnerId = remaining.id;
-      finishGame(room, 'Opponent left the race');
-    } else if (!remaining) {
-      finishGame(room, 'Both players left');
-    }
+  if (room.status === 'playing') {
+    player.disconnectTimer = setTimeout(() => {
+      player.disconnectTimer = null;
+      checkAbandonment(room, player);
+    }, RECONNECT_TIMEOUT_MS);
+    // The timer may have been delayed by an idle event loop — re-check now.
+    if (player.disconnectTimer.unref) player.disconnectTimer.unref();
   }
+
+  broadcast(room, {
+    type: MP.PLAYER_DISCONNECTED,
+    player: playerPublic(player),
+    reconnectTimeoutMs: RECONNECT_TIMEOUT_MS,
+    serverTime: now(),
+  });
+}
+
+function clearDisconnectTimer(player) {
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = null;
+  }
+}
+
+function restoreConnected(room, player) {
+  clearDisconnectTimer(player);
+  player.connected = true;
+  player.disconnectedAt = null;
+  player.reconnectDeadline = null;
+  room.lastActivity = now();
+}
+
+/**
+ * Deadline check for one disconnected player. Runs from the per-player timeout
+ * and from the periodic sweep; both are safe to call at any time.
+ */
+function checkAbandonment(room, player) {
+  if (room.status !== 'playing') return;
+  if (player.connected || !player.reconnectDeadline) return;
+  if (now() < player.reconnectDeadline) return; // reconnected or clock not up yet
+
+  const opponent = Array.from(room.players.values()).find((other) => other.id !== player.id);
+  if (opponent && (opponent.connected || opponent.completed)) {
+    // The opponent stayed (or already finished): they win by abandonment.
+    room.winnerId = opponent.id;
+    finishGame(room, 'Opponent did not reconnect within 10 minutes', {
+      resultReason: RESULT_REASONS.OPPONENT_ABANDONED,
+      abandonedPlayerId: player.id,
+    });
+  } else if (opponent && opponent.reconnectDeadline && opponent.reconnectDeadline > now()) {
+    // Both are gone but the opponent still has window left — wait for it.
+    return;
+  } else {
+    // Everyone's window expired: nobody wins, the race is void.
+    finishGame(room, 'Both players left the race', {
+      resultReason: RESULT_REASONS.PLAYER_ABANDONED,
+    });
+  }
+  schedulePersist();
+}
+
+/** Broadcasts the abandonment verdict to whoever is still listening. */
+function broadcastGameEnded(room) {
+  broadcast(room, {
+    type: MP.GAME_ENDED,
+    roomId: room.id,
+    reason: room.finishReason,
+    resultReason: room.resultReason,
+    abandonedPlayerId: room.abandonedPlayerId ?? null,
+    winnerId: room.winnerId,
+    finishedAt: room.finishedAt,
+    results: room.results,
+    serverTime: now(),
+  });
+}
+
+function removePlayer(room, playerId) {
+  const player = room.players.get(playerId);
+  if (!player) return;
+  markDisconnected(room, player);
+  console.log(
+    `[server] ${playerId} disconnected from ${room.id}` +
+      (room.status === 'playing' ? ` (reconnect window until ${new Date(player.reconnectDeadline).toISOString()})` : ''),
+  );
 }
 
 /* ------------------------------ sync API -------------------------------- */
@@ -607,8 +887,9 @@ wss.on('connection', (socket, request) => {
     if (!room || !socket.playerId) return;
     const player = room.players.get(socket.playerId);
     if (!player || player.socket !== socket) return;
-    removePlayer(room, socket.playerId, { keepGrace: true });
-    console.log(`[server] ${socket.playerId} disconnected from ${room.id} (grace period active)`);
+    // A dropped socket never ends a race by itself: the player gets a
+    // server-owned reconnection window, then the game is decided.
+    removePlayer(room, socket.playerId);
   });
 
   socket.on('error', (error) => console.warn('[server] socket error', error.message));
@@ -657,12 +938,16 @@ function handleClientMessage(socket, message) {
 
       if (existing) {
         // Reconnect: restore the authoritative state for this player.
+        restoreConnected(room, existing);
         existing.socket = socket;
-        existing.connected = true;
-        existing.disconnectedAt = null;
         existing.name = sanitizeName(message.name || existing.name);
         socket.roomId = room.id;
-        broadcast(room, { type: MP.PLAYER_RECONNECTED, player: playerPublic(existing) });
+        schedulePersist();
+        broadcast(room, {
+          type: MP.PLAYER_RECONNECTED,
+          player: playerPublic(existing),
+          serverTime: now(),
+        });
         send(socket, {
           type: MP.ROOM_STATE,
           room: roomSnapshot(room),
@@ -671,6 +956,16 @@ function handleClientMessage(socket, message) {
           ...resultSnapshot(room),
           serverTime: now(),
         });
+        // Someone coming back after their window expired gets the verdict
+        // spelled out: the race is over, it cannot be resumed.
+        if (
+          room.status === 'finished' &&
+          (room.resultReason === RESULT_REASONS.OPPONENT_ABANDONED ||
+            room.resultReason === RESULT_REASONS.PLAYER_ABANDONED) &&
+          room.abandonedPlayerId === existing.id
+        ) {
+          broadcastGameEnded(room);
+        }
         console.log(`[server] ${playerId} reconnected to ${room.id}`);
         return;
       }
@@ -720,6 +1015,7 @@ function handleClientMessage(socket, message) {
       player.ready = Boolean(message.ready);
       player.socket = socket;
       room.lastActivity = now();
+      schedulePersist();
       broadcastRoomState(room);
       const others = Array.from(room.players.values()).filter((other) => other.id !== playerId);
       if (others.length && others.every((other) => other.ready && other.connected) && player.ready && room.status === 'lobby') {
@@ -762,6 +1058,7 @@ function handleClientMessage(socket, message) {
       else player.progress.set(cell, value);
       player.socket = socket;
       room.lastActivity = now();
+      schedulePersist();
       broadcast(
         room,
         {
@@ -795,18 +1092,25 @@ function handleClientMessage(socket, message) {
       const wasPlaying = room.status === 'playing';
       const player = room.players.get(playerId);
       if (wasPlaying && player && !player.completed) {
+        // An explicit quit is a forfeit — no reconnection window is owed.
         const remaining = Array.from(room.players.values()).find((other) => other.id !== playerId);
         if (remaining) {
           room.winnerId = remaining.id;
-          finishGame(room, 'Opponent left the race');
+          finishGame(room, 'Opponent left the race', {
+            resultReason: RESULT_REASONS.OPPONENT_ABANDONED,
+            abandonedPlayerId: playerId,
+          });
         } else {
-          finishGame(room, 'Both players left');
+          finishGame(room, 'Both players left', { resultReason: RESULT_REASONS.PLAYER_ABANDONED });
         }
       }
+      if (player) clearDisconnectTimer(player);
       room.players.delete(playerId);
+      schedulePersist();
       broadcast(room, { type: MP.PLAYER_LEFT, player: { id: playerId } });
       if (!room.players.size) {
         rooms.delete(room.id);
+        schedulePersist();
         console.log(`[server] room ${room.id} disposed (empty)`);
       } else {
         broadcastRoomState(room);
@@ -823,6 +1127,8 @@ function handleClientMessage(socket, message) {
 /* ------------------------------- upkeep --------------------------------- */
 
 // Heartbeat: drop half-open sockets so the opponent sees an honest status.
+// A terminated dead socket fires 'close', which starts the player's
+// reconnection window — a brief network blip never ends the game outright.
 const heartbeat = setInterval(() => {
   for (const socket of wss.clients) {
     if (socket.isAlive === false) {
@@ -838,9 +1144,23 @@ const heartbeat = setInterval(() => {
   }
 }, 30000);
 
+// Deadline sweeper: the authoritative backstop for the abandonment rule. Every
+// room's reconnectDeadline lives in room state (and on disk), so this check
+// makes the rule fire even if a per-player setTimeout was lost — including
+// deadlines that expired while the server was down.
+const abandonmentSweep = setInterval(() => {
+  for (const room of rooms.values()) {
+    if (room.status !== 'playing') continue;
+    for (const player of room.players.values()) {
+      checkAbandonment(room, player);
+    }
+  }
+}, ABANDONMENT_SWEEP_MS);
+
 // Expire stale rooms and prune players that never came back.
 const cleanup = setInterval(() => {
   const stamp = now();
+  let mutated = false;
   for (const room of rooms.values()) {
     for (const player of Array.from(room.players.values())) {
       if (
@@ -849,29 +1169,42 @@ const cleanup = setInterval(() => {
         stamp - player.disconnectedAt > DISCONNECT_GRACE_MS &&
         room.status !== 'playing'
       ) {
+        clearDisconnectTimer(player);
         room.players.delete(player.id);
+        mutated = true;
       }
     }
     const anyConnected = Array.from(room.players.values()).some((player) => player.connected);
     if (!room.players.size || (!anyConnected && stamp - room.lastActivity > ROOM_TTL_MS)) {
       rooms.delete(room.id);
+      mutated = true;
       console.log(`[server] room ${room.id} expired`);
     }
   }
+  if (mutated) schedulePersist();
 }, 60000);
 
 server.on('close', () => {
   clearInterval(heartbeat);
+  clearInterval(abandonmentSweep);
   clearInterval(cleanup);
 });
+
+// Restore persisted rooms (and re-arm their deadlines) before accepting
+// connections so a restart can never resurrect a race that already expired.
+await loadRooms();
 
 server.listen(PORT, () => {
   console.log(`[server] Sudoku multiplayer server listening on http://localhost:${PORT}`);
   console.log(`[server] WebSocket endpoint: ws://localhost:${PORT}/ws`);
   console.log(`[server] serving static frontend from ${ROOT}`);
+  console.log(
+    `[server] reconnection window: ${RECONNECT_TIMEOUT_MS}ms, room state: ${ROOMS_FILE}`,
+  );
 });
 
 process.on('SIGINT', () => {
   console.log('\n[server] shutting down');
+  flushPersist();
   server.close(() => process.exit(0));
 });

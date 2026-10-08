@@ -599,6 +599,58 @@ select {
   transition: width 220ms ease;
 }
 
+/* opponent-disconnected countdown banner */
+
+.mp-disconnect {
+  margin-top: 10px;
+  background: var(--panel);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mp-disconnect[hidden] {
+  display: none;
+}
+
+.mp-disconnect-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--warning);
+}
+
+.mp-disconnect-text {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.mp-disconnect-label {
+  margin-top: 6px;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.mp-disconnect-count {
+  font-size: 2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--warning);
+  line-height: 1.1;
+}
+
+.mp-disconnect-wait {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
 /* --------------------------------------------------------- board */
 
 .board-wrap {

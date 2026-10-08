@@ -95,6 +95,17 @@
             </div>
           </div>
 
+          <div id="mp-disconnect" class="mp-disconnect" role="alert" hidden>
+            <p class="mp-disconnect-title">Opponent disconnected</p>
+            <p class="mp-disconnect-text">
+              <span id="mp-disconnect-name">Opponent</span> has left the game. The race continues —
+              the game will end automatically if they do not return in time.
+            </p>
+            <p class="mp-disconnect-label">Reconnection time remaining</p>
+            <p id="mp-disconnect-count" class="mp-disconnect-count">10:00</p>
+            <p class="mp-disconnect-wait">Waiting for opponent…</p>
+          </div>
+
           <div class="board-wrap">
             <div id="board" class="board" role="grid" aria-label="Sudoku board"></div>
             <div id="board-overlay" class="board-overlay" hidden>

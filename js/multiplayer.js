@@ -32,6 +32,7 @@ export const MP = {
   PLAYER_DISCONNECTED: 'PLAYER_DISCONNECTED',
   PLAYER_RECONNECTED: 'PLAYER_RECONNECTED',
   GAME_FINISHED: 'GAME_FINISHED',
+  GAME_ENDED: 'GAME_ENDED',
   PONG: 'PONG',
   ERROR: 'ERROR',
 };
@@ -99,6 +100,7 @@ export class MultiplayerClient extends Emitter {
     this.manualClose = false;
     this.reconnectTimer = null;
     this.pingTimer = null;
+    this.clockOffsetMs = 0; // serverTime − local clock, from the latest stamped message
   }
 
   /* --------------------------- session ----------------------------- */
@@ -365,6 +367,11 @@ export class MultiplayerClient extends Emitter {
     return this.room?.id || null;
   }
 
+  /** Server clock best estimate — deadlines are compared against this. */
+  serverNow() {
+    return Date.now() + this.clockOffsetMs;
+  }
+
   /* --------------------------- receiving --------------------------- */
 
   handleMessage(raw) {
@@ -376,6 +383,11 @@ export class MultiplayerClient extends Emitter {
       return;
     }
     if (!message || typeof message.type !== 'string') return;
+    // Every stamped message keeps the client's view of server time honest, so
+    // server deadlines (reconnect windows) render correctly on skewed clocks.
+    if (Number.isFinite(message.serverTime)) {
+      this.clockOffsetMs = message.serverTime - Date.now();
+    }
     this.emit('message', message);
 
     switch (message.type) {
@@ -399,6 +411,8 @@ export class MultiplayerClient extends Emitter {
             finishedAt: message.finishedAt,
             results: message.results,
             reason: message.reason || 'Race finished',
+            resultReason: message.resultReason,
+            abandonedPlayerId: message.abandonedPlayerId ?? null,
           });
         }
         break;
@@ -422,13 +436,19 @@ export class MultiplayerClient extends Emitter {
         this.emit('opponent-completed', message);
         break;
       case MP.PLAYER_DISCONNECTED:
-        this.emit('player-disconnected', message.player);
+        // Carries the server-owned reconnectDeadline the countdown renders.
+        this.emit('player-disconnected', message);
         break;
       case MP.PLAYER_RECONNECTED:
-        this.emit('player-reconnected', message.player);
+        this.emit('player-reconnected', message);
         break;
       case MP.GAME_FINISHED:
         this.emit('finished', message);
+        break;
+      case MP.GAME_ENDED:
+        // Abandonment verdict: also delivered to the disconnected player when
+        // they come back after the deadline has already passed.
+        this.emit('game-ended', message);
         break;
       case MP.PONG:
         break;

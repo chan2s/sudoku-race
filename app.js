@@ -599,6 +599,7 @@ class SudokuApp {
         away: opponent ? !opponent.connected : false,
       });
       if (room.status === 'lobby') this.ui.hideOverlay();
+      this.syncDisconnectBanner();
     });
     client.on('game-started', (game) => this.handleRaceStart(game));
     client.on('progress', () => this.refreshOpponentProgress());
@@ -607,16 +608,44 @@ class SudokuApp {
       this.ui.setOpponent({ done: true, finalMs: message.elapsedMs, progress: 1 });
       this.ui.announce(`Opponent finished in ${formatTime(message.elapsedMs)}`);
     });
-    client.on('player-disconnected', () => {
+    client.on('player-disconnected', (message) => {
+      const player = message.player || {};
       this.ui.setOpponent({ away: true });
-      this.ui.showToast('Opponent disconnected — they can rejoin');
+      // The server owns the window; the banner only renders its deadline.
+      this.syncDisconnectBanner();
+      if (this.ui.disconnectCountdown) {
+        this.ui.announce(
+          `${player.name || 'Opponent'} disconnected. They have 10 minutes to reconnect.`,
+        );
+      } else {
+        this.ui.showToast('Opponent disconnected — they can rejoin');
+      }
     });
-    client.on('player-reconnected', () => {
+    client.on('player-reconnected', (message) => {
+      const name = message.player?.name || 'Opponent';
       this.ui.setOpponent({ away: false });
-      this.ui.showToast('Opponent is back');
+      this.ui.hideDisconnectCountdown();
+      this.ui.showToast(`✓ ${name} reconnected — game resumed`);
+      this.ui.announce('Opponent reconnected. Game resumed.');
+    });
+    client.on('game-ended', (message) => {
+      // Abandonment verdict. The winner normally already saw GAME_FINISHED;
+      // the disconnected player gets their expiration screen from here.
+      if (message.abandonedPlayerId && message.abandonedPlayerId !== client.playerId) return;
+      if (this.lastRaceKey === `${message.roomId}:${message.finishedAt || message.resultReason}`) return;
+      this.handleRaceFinished({
+        winnerId: message.winnerId,
+        results: message.results || [],
+        reason: message.reason,
+        resultReason: message.resultReason,
+        abandonedPlayerId: message.abandonedPlayerId,
+        roomId: message.roomId,
+        finishedAt: message.finishedAt,
+      });
     });
     client.on('player-left', () => {
       this.ui.setOpponent({ left: true, away: false });
+      this.ui.hideDisconnectCountdown();
       this.ui.showToast('Opponent left the room');
     });
     client.on('finished', (message) => this.handleRaceFinished(message));
