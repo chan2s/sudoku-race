@@ -13,9 +13,12 @@ import {
   MultiplayerClient,
   CONNECTION_STATE,
   MP_ERRORS,
+  MAX_MISTAKES,
   defaultMultiplayerUrl,
   readStoredSession,
 } from './js/multiplayer.js';
+import { ChatClient } from './js/chat.js';
+import { ChatUI } from './js/chat-ui.js';
 import { UI } from './js/ui.js';
 import { formatTime } from './js/timer.js';
 
@@ -37,6 +40,8 @@ class SudokuApp {
     this.sync = new SyncManager({ storage: StorageManager });
     this.crossTab = new CrossTab('sudoku-app');
     this.client = null;
+    this.chat = null;
+    this.chatUI = null;
     this.engine = null;
     this.settings = { ...DEFAULT_SETTINGS, playerName: '' };
     this.stats = defaultStats();
@@ -62,6 +67,8 @@ class SudokuApp {
       onToggleReady: () => this.toggleReady(),
       onStartGame: () => this.startRace(),
       onLeaveRoom: () => this.leaveRoom(),
+      onOpenChat: () => this.openMultiplayerChat(),
+      onCloseChat: () => this.chatUI?.closeMobileChat(),
       onSaveSettings: (patch) => this.saveSettings(patch),
       onExportData: () => this.exportData(),
       onClearData: () => this.clearData(),
@@ -228,8 +235,22 @@ class SudokuApp {
       this.ui.renderResumeBanner(null);
       this.schedulePersist();
     });
-    this.engine.on('mistake', ({ mistakes }) => {
-      this.ui.announce(`Incorrect number. Mistake ${mistakes} of ${this.engine.mistakeLimit}.`);
+    this.engine.on('mistake', ({ mistakes, remaining }) => {
+      const max = this.engine.mistakeLimit;
+      if (this.engine.mode === 'multiplayer') {
+        // The server told us this one was wrong; show the short feedback and
+        // the authoritative counter without freezing the board.
+        const final = Number(remaining) === 0;
+        this.ui.showMistakeFeedback(mistakes, max, { final });
+        this.ui.setYou({ mistakes, maxMistakes: max, eliminated: final });
+        this.ui.announce(
+          final
+            ? `Final mistake. Mistakes ${mistakes} of ${max}.`
+            : `Incorrect number. Mistake ${mistakes} of ${max}.`,
+        );
+      } else {
+        this.ui.announce(`Incorrect number. Mistake ${mistakes} of ${max}.`);
+      }
       this.ui.vibrate([24, 40, 24]);
     });
     this.engine.on('complete', (payload) => this.handleComplete(payload));
@@ -250,6 +271,35 @@ class SudokuApp {
     this.ui.engine = null;
     clearTimeout(this.saveTimer);
   }
+
+  /* --------------------------- chat lifecycle --------------------- */
+
+  isMobileLayout() {
+    return typeof window !== 'undefined' && window.matchMedia('(max-width: 759px)').matches;
+  }
+
+  /**
+   * Shows the chat surface for the current context: the side panel next to the
+   * board during a multiplayer race on desktop, the compact button on mobile.
+   * Single player and the lobby never show either one.
+   */
+  updateChatVisibility() {
+    const el = this.ui.elements;
+    const show = Boolean(this.client?.room) && this.engine?.mode === 'multiplayer';
+    if (el.chatPanel) el.chatPanel.hidden = !show;
+    if (el.chatBtn) el.chatBtn.hidden = !show;
+    if (!show) this.chatUI?.closeMobileChat();
+    // Widen the app shell only while a race needs the two-column layout.
+    document.querySelector('.screens')?.classList.toggle('screens--wide', show);
+    el.chatPanel?.closest('.screen')?.classList.toggle('mp-active', show);
+  }
+
+  openMultiplayerChat() {
+    if (!this.chatUI || !this.client?.room) return;
+    if (this.isMobileLayout()) this.chatUI.openMobileChat();
+  }
+
+  /* --------------------------- screens ---------------------------- */
 
   startSinglePlayer(difficulty = 'easy', { seed, fresh = true } = {}) {
     let engine;
@@ -325,7 +375,7 @@ class SudokuApp {
     const index = engine.selectedIndex;
     const result = engine.setValue(index, value);
     if (!result.changed) return;
-    if (engine.mode === 'multiplayer') this.sendProgress(index, engine.valueAt(index));
+    if (engine.mode === 'multiplayer') this.sendMove(index, engine.valueAt(index));
   }
 
   erase() {
@@ -333,7 +383,7 @@ class SudokuApp {
     if (!engine || engine.selectedIndex === null) return;
     const index = engine.selectedIndex;
     const result = engine.erase(index);
-    if (result.changed && engine.mode === 'multiplayer') this.sendProgress(index, 0);
+    if (result.changed && engine.mode === 'multiplayer') this.sendMove(index, 0);
   }
 
   togglePause() {
@@ -442,9 +492,12 @@ class SudokuApp {
     const engine = this.engine;
     if (!engine) return;
     const state = engine.toState();
-    this.engineSavedState = state.status === GAME_STATUS.COMPLETED || state.status === GAME_STATUS.FAILED
-      ? null
-      : state;
+    this.engineSavedState =
+      state.status === GAME_STATUS.COMPLETED ||
+      state.status === GAME_STATUS.FAILED ||
+      state.status === GAME_STATUS.FINISHED
+        ? null
+        : state;
     this.storage.saveGame(state);
     this.queueSync('game-state', state);
     this.crossTab.post('game-updated', {});
@@ -572,9 +625,16 @@ class SudokuApp {
   openMultiplayer() {
     this.ui.setConnection({ state: CONNECTION_STATE.CONNECTING, message: '' });
     const client = this.ensureClient();
-    if (client.room) this.ui.setRoom(client.room);
-    else if (!client.connected) client.connect().catch(() => this.ui.setConnection({ state: CONNECTION_STATE.RECONNECTING }));
-    else this.ui.setConnection({ state: CONNECTION_STATE.CONNECTED, message: '' });
+    if (client.room) {
+      // Keep the identity marker: without youId the lobby cannot tell which
+      // player is "me" and disables the ready button on a return visit.
+      this.ui.setRoom({ ...client.room, youId: client.playerId });
+      if (client.connected) this.ui.setConnection({ state: CONNECTION_STATE.CONNECTED, message: '' });
+    } else if (!client.connected) {
+      client.connect().catch(() => this.ui.setConnection({ state: CONNECTION_STATE.RECONNECTING }));
+    } else {
+      this.ui.setConnection({ state: CONNECTION_STATE.CONNECTED, message: '' });
+    }
     this.ui.renderLobby();
   }
 
@@ -600,8 +660,10 @@ class SudokuApp {
       });
       if (room.status === 'lobby') this.ui.hideOverlay();
       this.syncDisconnectBanner();
+      this.updateChatVisibility();
     });
     client.on('game-started', (game) => this.handleRaceStart(game));
+    client.on('move-result', (message) => this.handleMoveResult(message));
     client.on('progress', () => this.refreshOpponentProgress());
     client.on('progress-state', () => this.refreshOpponentProgress());
     client.on('opponent-completed', (message) => {
@@ -664,7 +726,37 @@ class SudokuApp {
         message: `retry ${attempt} in ${Math.round(delay / 1000)}s`,
       });
     });
+
+    // Chat is layered on top of the same room WebSocket — never a second
+    // connection. The board module never touches it.
+    if (!this.chat) {
+      this.chat = new ChatClient({ client });
+      this.chatUI = new ChatUI({ ui: this.ui, elements: this.ui.elements });
+      this.chat.attach();
+      this.chatUI.setChat(this.chat);
+      this.chat.syncFromClient();
+    }
+
     return client;
+  }
+
+  /**
+   * Renders (or clears) the opponent-disconnect countdown using the
+   * server-owned deadline carried in room state, so the visible window is
+   * correct even after a refresh or rejoin.
+   */
+  syncDisconnectBanner() {
+    const client = this.client;
+    const opponent = client?.opponent();
+    if (opponent && opponent.connected === false && Number.isFinite(Number(opponent.reconnectDeadline))) {
+      this.ui.showDisconnectCountdown({
+        name: opponent.name,
+        deadline: Number(opponent.reconnectDeadline),
+        serverNow: () => (client ? client.serverNow() : Date.now()),
+      });
+    } else {
+      this.ui.hideDisconnectCountdown();
+    }
   }
 
   createRoom(difficulty, name) {
@@ -724,8 +816,13 @@ class SudokuApp {
   }
 
   teardownMultiplayer() {
+    this.chatUI?.detachChat();
+    this.chat?.detach();
+    this.chatUI = null;
+    this.chat = null;
     this.client?.leaveRoom();
     this.client = null;
+    this.updateChatVisibility();
   }
 
   handleRaceStart(game) {
@@ -753,7 +850,7 @@ class SudokuApp {
           difficulty: game.difficulty,
           seed: game.seed,
           mode: 'multiplayer',
-          mistakeLimit: Infinity, // races are decided by finishing, never by mistakes
+          mistakeLimit: MAX_MISTAKES, // server-authoritative: 3 and you are out
           roomId: game.roomId,
           roomCode: this.client?.room?.code,
           playerId: this.client?.playerId,
@@ -766,13 +863,28 @@ class SudokuApp {
       this.ui.setOpponent({ done: false, away: false, left: false, progress: 0, finalMs: null });
     }
 
+    // The server owns the mistake state; adopt it (covers a fresh race — all
+    // zeroes — and a rejoin after a disconnect, which must not reset mistakes).
+    const serverPlayer = this.client?.me?.() || null;
+    engine.mistakeLimit = Number(serverPlayer?.maxMistakes) > 0 ? Number(serverPlayer.maxMistakes) : MAX_MISTAKES;
+    engine.mistakes = Number(serverPlayer?.mistakes) || 0;
+    engine.eliminated = Boolean(serverPlayer?.eliminated);
+
     this.mpPuzzleId = game.puzzleId;
     engine.multiplayerStartedAt = game.startedAt;
     this.attachEngine(engine, { fresh: false });
     this.ui.setServerOffset(game.startedAt);
-    this.ui.setYou({ progress: engine.progress, done: engine.status === GAME_STATUS.COMPLETED });
+    this.ui.setYou({
+      progress: engine.progress,
+      done: engine.status === GAME_STATUS.COMPLETED,
+      mistakes: engine.mistakes,
+      maxMistakes: engine.mistakeLimit,
+      eliminated: engine.eliminated,
+    });
+    this.ui.hideMistakeFeedback();
     this.ui.hideOverlay();
     this.ui.renderOverlay();
+    this.updateChatVisibility();
     if (game.status === 'finished') {
       this.ui.showToast('That race has already finished');
     } else {
@@ -788,8 +900,32 @@ class SudokuApp {
     this.refreshOwnProgress();
   }
 
+  /** Submits a cell to the server, which validates it and owns the mistakes. */
+  sendMove(cell, value) {
+    if (!this.client?.room) return;
+    this.client.sendMove(cell, value);
+    this.refreshOwnProgress();
+  }
+
+  /** Applies the server's authoritative verdict for one of our moves. */
+  handleMoveResult(message) {
+    const engine = this.engine;
+    if (!engine || engine.mode !== 'multiplayer') return;
+    if (!engine.applyServerMove(message)) return;
+    this.ui.setYou({
+      progress: engine.progress,
+      done: engine.status === GAME_STATUS.COMPLETED,
+      mistakes: engine.mistakes,
+      maxMistakes: engine.mistakeLimit,
+    });
+    this.ui.renderHeader();
+    this.persistNow();
+  }
+
   sendCompleted() {
     if (!this.client || !this.engine) return;
+    // An eliminated player has no completion to report.
+    if (this.engine.eliminated) return;
     this.client.sendCompleted(this.engine.board);
   }
 
@@ -804,9 +940,30 @@ class SudokuApp {
     this.ui.setOpponent({ progress: ratio });
   }
 
-  async handleRaceFinished({ winnerId, results = [], reason = '', roomId = '', finishedAt = 0 }) {
+  async handleRaceFinished({
+    winnerId,
+    results = [],
+    reason = '',
+    resultReason = '',
+    roomId = '',
+    finishedAt = 0,
+    eliminatedPlayerId = null,
+    loserId = null,
+  }) {
     const youId = this.client?.playerId;
     const youWon = winnerId && winnerId === youId;
+    const youEliminated = Boolean(eliminatedPlayerId) && eliminatedPlayerId === youId;
+    // The server decided the race: lock both boards and freeze both clocks.
+    if (this.engine?.mode === 'multiplayer') {
+      this.engine.finishRace({ eliminated: youEliminated });
+      this.ui.setGame(this.engine);
+      this.ui.setYou({
+        done: true,
+        eliminated: youEliminated,
+        mistakes: this.engine.mistakes,
+        maxMistakes: this.engine.mistakeLimit,
+      });
+    }
     // A rejoin replays the stored result — only count it once.
     const raceKey = `${roomId}:${finishedAt || reason}`;
     const alreadyCounted = raceKey === this.lastRaceKey;
@@ -831,9 +988,19 @@ class SudokuApp {
     this.ui.mpStats = this.mpStats;
     this.refreshStatsViews();
     this.ui.setOpponent({ done: true });
-    this.ui.setYou({ done: true });
-    this.ui.showResult({ winnerId, youId, results, reason });
-    this.ui.announce(youWon ? 'You won the race!' : winnerId ? 'You lost the race.' : 'Race finished.');
+    this.ui.setYou({ done: true, eliminated: youEliminated });
+    this.ui.showResult({ winnerId, youId, results, reason, resultReason, eliminatedPlayerId, loserId });
+    this.ui.announce(
+      resultReason === 'OPPONENT_MISTAKE_LIMIT'
+        ? youWon
+          ? 'You won — your opponent reached the mistake limit.'
+          : 'You lost — you reached the mistake limit.'
+        : youWon
+          ? 'You won the race!'
+          : winnerId
+            ? 'You lost the race.'
+            : 'Race finished.',
+    );
     this.persistNow();
   }
 
@@ -846,6 +1013,7 @@ class SudokuApp {
       this.ui.renderTimer();
       if (engine.mode === 'multiplayer') this.refreshOpponentProgress();
     }
+    if (this.ui.disconnectCountdown) this.ui.renderDisconnectCountdown();
     // Persist periodically so a hard crash mid-game loses at most a few seconds.
     if (engine.isRunning && Date.now() - (this.lastPersist || 0) > 5000) {
       this.lastPersist = Date.now();

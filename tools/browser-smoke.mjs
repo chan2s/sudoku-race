@@ -804,6 +804,73 @@ try {
     assert.ok(mpStats.wins >= 1);
   });
 
+  await test('three mistakes eliminate the player, award the win and keep chat alive', async () => {
+    // Back to the lobby from the result overlay and start a rematch.
+    await page.evaluate(`document.querySelector('#overlay-actions [data-action="go-multiplayer"]')?.click()`);
+    await pageB.evaluate(`document.querySelector('#overlay-actions [data-action="go-multiplayer"]')?.click()`);
+    await waitFor(() => page.evaluate(`!document.querySelector('#mp-room').hidden`), { label: 'lobby tab A' });
+    await waitFor(() => pageB.evaluate(`!document.querySelector('#mp-room').hidden`), { label: 'lobby tab B' });
+    await page.evaluate(`document.querySelector('#mp-ready').click()`);
+    await pageB.evaluate(`document.querySelector('#mp-ready').click()`);
+    await waitFor(
+      () => page.evaluate(`!document.querySelector('#mp-hud').hidden && document.querySelector('#board-overlay').hidden`),
+      { timeout: 15000, label: 'rematch started in tab A' },
+    );
+    await waitFor(
+      () => pageB.evaluate(`!document.querySelector('#mp-hud').hidden && document.querySelector('#board-overlay').hidden`),
+      { timeout: 15000, label: 'rematch started in tab B' },
+    );
+    await sleep(400); // let the new game snapshot land in storage
+    const stateB = await readGameState(pageB);
+    const empties = stateB.puzzle.map((value, index) => (value === 0 ? index : -1)).filter((i) => i >= 0);
+
+    // Tab B deliberately answers three cells wrong.
+    for (let i = 0; i < 3; i++) {
+      const cell = empties[i];
+      const wrong = stateB.solution[cell] === 9 ? 1 : stateB.solution[cell] + 1;
+      await pageB.evaluate(
+        `document.querySelector('.cell[data-index="${cell}"]').click();` +
+          `document.querySelector('.numpad button[data-value="${wrong}"]').click();`,
+      );
+      await waitFor(
+        () => pageB.evaluate(`document.querySelector('#mp-you-mistakes').textContent.includes('${i + 1} / 3')`),
+        { label: `mistake ${i + 1} counted` },
+      );
+    }
+
+    await waitFor(() => pageB.evaluate(`!document.querySelector('#board-overlay').hidden`), {
+      timeout: 15000,
+      label: 'loser result overlay',
+    });
+    await waitFor(() => page.evaluate(`!document.querySelector('#board-overlay').hidden`), {
+      timeout: 15000,
+      label: 'winner result overlay',
+    });
+
+    const loser = await pageB.evaluate(`(() => ({
+      title: document.querySelector('#overlay-title').textContent,
+      text: document.querySelector('#overlay-text').textContent,
+      mistakes: document.querySelector('#mp-you-mistakes').textContent,
+      chatVisible: !document.querySelector('#chat-panel').hidden,
+      chatInputDisabled: document.querySelector('#chat-input').disabled,
+      numpadDisabled: Array.from(document.querySelectorAll('.numpad button')).every((b) => b.disabled),
+    }))()`);
+    assert.match(loser.title, /GAME OVER/i, `loser title was "${loser.title}"`);
+    assert.match(loser.text, /maximum number of mistakes/i);
+    assert.match(loser.mistakes, /3 \/ 3/);
+    assert.equal(loser.numpadDisabled, true, 'the eliminated player cannot keep playing');
+    assert.equal(loser.chatVisible, true, 'chat stays available after the game ends');
+    assert.equal(loser.chatInputDisabled, false, 'the chat input remains usable');
+
+    const winner = await page.evaluate(`(() => ({
+      title: document.querySelector('#overlay-title').textContent,
+      text: document.querySelector('#overlay-text').textContent,
+    }))()`);
+    assert.match(winner.title, /YOU WIN/i, `winner title was "${winner.title}"`);
+    assert.match(winner.text, /mistake limit/i);
+    await page.screenshot('06-mistake-limit');
+  });
+
   await test('an opponent that drops out is flagged away, and a reappearing tab rejoins the same table', async () => {
     // Navigating away inside the tab closes the WebSocket for real.
     await pageB.send('Page.navigate', { url: 'about:blank' });

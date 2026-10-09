@@ -584,6 +584,62 @@ select {
   color: var(--warning);
 }
 
+/* mistake counter in the player's own card, next to the clock */
+.mp-mistakes {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.mp-mistakes.is-warning {
+  color: var(--warning);
+}
+
+.mp-mistakes.is-danger {
+  color: var(--danger);
+}
+
+/* short, self-clearing mistake feedback — never over the grid */
+.mistake-flash {
+  position: fixed;
+  top: 56px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 45;
+  max-width: min(92vw, 420px);
+  text-align: center;
+  padding: 0.55rem 1.1rem;
+  border-radius: 999px;
+  background: var(--danger-soft);
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, transparent);
+  color: var(--danger);
+  font-weight: 700;
+  font-size: 0.9rem;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  animation: mistake-pop 260ms ease-out;
+}
+
+.mistake-flash.is-final {
+  background: color-mix(in srgb, var(--danger) 28%, var(--panel));
+}
+
+@keyframes mistake-pop {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-6px) scale(0.96);
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1.03);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(-50%) scale(1);
+  }
+}
+
 .progress {
   height: 8px;
   background: var(--panel-2);
@@ -715,6 +771,25 @@ select {
 
 .cell.wrong {
   color: var(--danger);
+}
+
+/* A newly-wrong cell gives a short shake; the class is only re-applied when the
+   marker actually changes, so it does not replay on every render. */
+.cell.wrong {
+  animation: mistake-cell 360ms ease-out;
+}
+
+@keyframes mistake-cell {
+  0% {
+    background: var(--danger-soft);
+    transform: translateX(-2px);
+  }
+  50% {
+    transform: translateX(2px);
+  }
+  100% {
+    transform: translateX(0);
+  }
 }
 
 .cell.selected.wrong {
@@ -868,6 +943,253 @@ select {
 
 .controls .btn {
   padding: 0.6rem 0.4rem;
+}
+
+/* -------------------------------------------------- chat */
+
+.chat-panel {
+  flex: 0 0 auto;
+  width: 320px;
+  max-width: 360px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 120px);
+}
+
+.chat-panel-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow: hidden;
+  min-height: 280px;
+}
+
+.chat-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.chat-panel-title {
+  margin: 0;
+  font-size: 0.75rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.chat-status {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+
+.chat-status--hidden {
+  visibility: hidden;
+}
+
+.chat-messages {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 140px;
+  max-height: 360px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+}
+
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-msg.is-mine {
+  align-items: flex-end;
+}
+
+.chat-msg.is-mine .chat-msg-body {
+  align-items: flex-end;
+}
+
+.chat-msg-body {
+  max-width: 100%;
+}
+
+.chat-msg-name {
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 1px;
+}
+
+.chat-msg-text {
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 6px 9px;
+  border-radius: 12px;
+  border-bottom-right-radius: 3px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.chat-msg.is-mine .chat-msg-text {
+  background: var(--accent-soft);
+  border-bottom-right-radius: 12px;
+  border-bottom-left-radius: 3px;
+}
+
+.chat-msg-ts {
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+}
+
+.chat-new-cue {
+  text-align: center;
+  font-size: 0.72rem;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+  padding: 4px;
+}
+
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.chat-input {
+  flex: 1 1 auto;
+  min-height: 38px;
+}
+
+/* mobile chat */
+
+.chat-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  min-height: 46px;
+}
+
+.chat-btn:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-color: var(--accent);
+}
+
+.chat-badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-mobile-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  border-radius: 18px 18px 0 0;
+  box-shadow: 0 -12px 30px rgba(0, 0, 0, 0.4);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-mobile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-mobile-title {
+  margin: 0;
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+}
+
+.chat-mobile-status {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  padding: 8px 16px;
+  white-space: pre-wrap;
+}
+
+.chat-mobile-messages {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+}
+
+.chat-mobile-input-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  align-items: stretch;
+}
+
+.chat-mobile-input {
+  flex: 1 1 auto;
+  min-height: 42px;
+}
+
+.chat-mobile-send {
+  min-width: 74px;
+}
+
+.chat-mobile-messages .chat-msg .chat-msg-text {
+  max-width: 88%;
+}
+
+/* desktop: mobile-bottom-sheet styles are irrelevant */
+@media (min-width: 760px) {
+  .chat-btn,
+  .chat-mobile-panel {
+    display: none !important;
+  }
+}
+
+/* mobile: the desktop sidebar is hidden; show the chat button in the multiplayer screen. */
+@media (max-width: 759px) {
+  .chat-panel {
+    display: none !important;
+  }
 }
 
 /* -------------------------------------------------- multiplayer */

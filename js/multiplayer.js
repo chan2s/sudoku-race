@@ -17,6 +17,7 @@ export const MP = {
   PLAYER_READY: 'PLAYER_READY',
   START_GAME: 'START_GAME',
   PLAYER_PROGRESS: 'PLAYER_PROGRESS',
+  PLAYER_MOVE: 'PLAYER_MOVE',
   PLAYER_COMPLETED: 'PLAYER_COMPLETED',
   REQUEST_STATE: 'REQUEST_STATE',
   LEAVE_ROOM: 'LEAVE_ROOM',
@@ -28,6 +29,8 @@ export const MP = {
   PLAYER_LEFT: 'PLAYER_LEFT',
   GAME_STARTED: 'GAME_STARTED',
   PROGRESS_STATE: 'PROGRESS_STATE',
+  PLAYER_PROGRESS: 'PLAYER_PROGRESS',
+  MOVE_RESULT: 'MOVE_RESULT',
   PLAYER_COMPLETED: 'PLAYER_COMPLETED',
   PLAYER_DISCONNECTED: 'PLAYER_DISCONNECTED',
   PLAYER_RECONNECTED: 'PLAYER_RECONNECTED',
@@ -35,6 +38,26 @@ export const MP = {
   GAME_ENDED: 'GAME_ENDED',
   PONG: 'PONG',
   ERROR: 'ERROR',
+  // chat
+  CHAT_MESSAGE: 'CHAT_MESSAGE',
+  CHAT_HISTORY: 'CHAT_HISTORY',
+  CHAT_ERROR: 'CHAT_ERROR',
+  CHAT_RATE_LIMITED: 'CHAT_RATE_LIMITED',
+};
+
+/**
+ * Maximum mistakes a player may make in a multiplayer race before the server
+ * eliminates them. Shared by the client (for display) and the server (for the
+ * authoritative rule) so the two can never drift apart.
+ */
+export const MAX_MISTAKES = 3;
+
+/** Explicit result reasons the server stores with every finished race. */
+export const RESULT_REASON = {
+  PLAYER_COMPLETED: 'PLAYER_COMPLETED',
+  OPPONENT_COMPLETED: 'OPPONENT_COMPLETED',
+  OPPONENT_MISTAKE_LIMIT: 'OPPONENT_MISTAKE_LIMIT',
+  OPPONENT_ABANDONED: 'OPPONENT_ABANDONED',
 };
 
 export const CONNECTION_STATE = {
@@ -353,6 +376,16 @@ export class MultiplayerClient extends Emitter {
     return this.send({ type: MP.PLAYER_PROGRESS, roomId: this.roomId(), cell, value, timestamp });
   }
 
+  /**
+   * Submits a single cell entry for server-authoritative validation. The server
+   * decides whether it is correct and owns the mistake count; nothing here is
+   * trusted. `value` 0 clears the cell and is never a mistake.
+   */
+  sendMove(cell, value) {
+    if (!this.room) return false;
+    return this.send({ type: MP.PLAYER_MOVE, roomId: this.roomId(), cell, value });
+  }
+
   sendCompleted(board, timestamp = Date.now()) {
     if (!this.room) return false;
     return this.send({
@@ -365,6 +398,18 @@ export class MultiplayerClient extends Emitter {
 
   roomId() {
     return this.room?.id || null;
+  }
+
+  /** Sends a chat message through the same room WebSocket connection. */
+  sendChatMessage(message) {
+    if (!this.room) return false;
+    return this.send({ type: MP.CHAT_MESSAGE, roomId: this.roomId(), message });
+  }
+
+  /** Requests stored chat history for the current room, when supported. */
+  requestChatHistory() {
+    if (!this.room) return false;
+    return this.send({ type: MP.CHAT_HISTORY, roomId: this.roomId() });
   }
 
   /** Server clock best estimate — deadlines are compared against this. */
@@ -413,6 +458,8 @@ export class MultiplayerClient extends Emitter {
             reason: message.reason || 'Race finished',
             resultReason: message.resultReason,
             abandonedPlayerId: message.abandonedPlayerId ?? null,
+            eliminatedPlayerId: message.eliminatedPlayerId ?? null,
+            loserId: message.loserId ?? null,
           });
         }
         break;
@@ -431,6 +478,11 @@ export class MultiplayerClient extends Emitter {
       case MP.PLAYER_PROGRESS:
         this.applyProgress(message.playerId, message.cell, message.value);
         this.emit('progress', message);
+        break;
+      case MP.MOVE_RESULT:
+        // The server's verdict for our own move: correctness + authoritative
+        // mistake count. The client never computes these itself.
+        this.emit('move-result', message);
         break;
       case MP.PLAYER_COMPLETED:
         this.emit('opponent-completed', message);
@@ -453,7 +505,23 @@ export class MultiplayerClient extends Emitter {
       case MP.PONG:
         break;
       case MP.ERROR:
-        this.emit('server-error', { code: message.code, message: message.message });
+        if (message.code === 'CHAT_RATE_LIMITED') {
+          this.emit('chat-error', { code: 'CHAT_RATE_LIMITED', message: message.message });
+        } else {
+          this.emit('server-error', { code: message.code, message: message.message });
+        }
+        break;
+      case MP.CHAT_RATE_LIMITED:
+        this.emit('chat-error', { code: MP.CHAT_RATE_LIMITED, message: message.message });
+        break;
+      case MP.CHAT_MESSAGE:
+        this.emit('chat-message', message);
+        break;
+      case MP.CHAT_HISTORY:
+        this.emit('chat-history', message);
+        break;
+      case MP.CHAT_ERROR:
+        this.emit('chat-error', message);
         break;
       default:
         break;

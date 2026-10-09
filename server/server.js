@@ -21,7 +21,7 @@ import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { generatePuzzle, isValidSolution } from '../js/sudoku.js';
-import { MP } from '../js/multiplayer.js';
+import { MP, MAX_MISTAKES } from '../js/multiplayer.js';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -44,15 +44,28 @@ const PERSIST_DEBOUNCE_MS = 250;
 const MAX_ROOM_PLAYERS = 2;
 const MAX_MESSAGES_PER_WINDOW = 120;
 const RATE_WINDOW_MS = 1000;
+const MAX_CHAT_LENGTH = 250;
+const MAX_CHAT_PER_SECOND = 5;
+const CHAT_RATE_WINDOW_MS = 1000;
+const MAX_CHAT_HISTORY = 200;
 const MAX_SYNC_RECORDS = 5000;
 
 /** Result vocabulary — `resultReason` travels with every finished race. */
 const RESULT_REASONS = {
   PUZZLE_COMPLETED: 'PUZZLE_COMPLETED',
+  PLAYER_COMPLETED: 'PLAYER_COMPLETED',
+  OPPONENT_COMPLETED: 'OPPONENT_COMPLETED',
+  OPPONENT_MISTAKE_LIMIT: 'OPPONENT_MISTAKE_LIMIT',
   OPPONENT_ABANDONED: 'OPPONENT_ABANDONED',
   PLAYER_ABANDONED: 'PLAYER_ABANDONED',
   DRAW: 'DRAW',
   SERVER_CANCELLED: 'SERVER_CANCELLED',
+};
+
+/** Player lifecycle inside a race. */
+const PLAYER_STATUS = {
+  PLAYING: 'playing',
+  ELIMINATED: 'eliminated',
 };
 
 const MIME_TYPES = {
@@ -142,10 +155,13 @@ function serializeRoom(room) {
     startedAt: room.startedAt,
     finishedAt: room.finishedAt,
     winnerId: room.winnerId,
+    loserId: room.loserId,
     finishReason: room.finishReason,
     resultReason: room.resultReason,
     abandonedPlayerId: room.abandonedPlayerId,
+    eliminatedPlayerId: room.eliminatedPlayerId,
     results: room.results,
+    chatHistory: Array.isArray(room.chatHistory) ? room.chatHistory.slice(-MAX_CHAT_HISTORY) : [],
     players: Array.from(room.players.values()).map((player) => ({
       id: player.id,
       name: player.name,
@@ -156,6 +172,10 @@ function serializeRoom(room) {
       elapsedMs: player.elapsedMs,
       disconnectedAt: player.disconnectedAt,
       reconnectDeadline: player.reconnectDeadline,
+      mistakes: player.mistakes,
+      maxMistakes: player.maxMistakes,
+      eliminated: player.eliminated,
+      status: player.status,
       progress: Array.from(player.progress.entries()),
     })),
   };
@@ -229,10 +249,17 @@ async function loadRooms() {
       const room = {
         ...stored,
         players: new Map(),
+        chatHistory: Array.isArray(stored.chatHistory) ? stored.chatHistory.slice(-MAX_CHAT_HISTORY) : [],
       };
       for (const storedPlayer of stored.players || []) {
         const player = {
           ...storedPlayer,
+          // Mistake state is part of the authoritative race; older snapshots
+          // that predate it simply start everyone clean.
+          mistakes: Number(storedPlayer.mistakes) || 0,
+          maxMistakes: Number(storedPlayer.maxMistakes) || MAX_MISTAKES,
+          eliminated: Boolean(storedPlayer.eliminated),
+          status: storedPlayer.eliminated ? PLAYER_STATUS.ELIMINATED : PLAYER_STATUS.PLAYING,
           progress: new Map(storedPlayer.progress || []),
           socket: null,
           disconnectTimer: null,
@@ -286,10 +313,13 @@ function createRoom(playerId, name, difficulty) {
     startedAt: null,
     finishedAt: null,
     winnerId: null,
+    loserId: null,
     finishReason: null,
     resultReason: null,
     abandonedPlayerId: null,
+    eliminatedPlayerId: null,
     results: null,
+    chatHistory: [],
     players: new Map(),
   };
   rooms.set(code, room);
@@ -309,6 +339,11 @@ function addPlayer(room, { id, name, socket }) {
     disconnectedAt: null,
     reconnectDeadline: null,
     disconnectTimer: null,
+    // Server-owned mistake state — never taken from the client.
+    mistakes: 0,
+    maxMistakes: MAX_MISTAKES,
+    eliminated: false,
+    status: PLAYER_STATUS.PLAYING,
     progress: new Map(),
     socket,
   };
@@ -340,6 +375,10 @@ function roomSnapshot(room) {
       elapsedMs: player.elapsedMs,
       disconnectedAt: player.disconnectedAt,
       reconnectDeadline: player.reconnectDeadline,
+      mistakes: player.mistakes,
+      maxMistakes: player.maxMistakes,
+      eliminated: player.eliminated,
+      status: player.status,
     })),
   };
 }
@@ -360,6 +399,8 @@ function resultSnapshot(room) {
     reason: room.finishReason || 'Race finished',
     resultReason: room.resultReason || RESULT_REASONS.PUZZLE_COMPLETED,
     abandonedPlayerId: room.abandonedPlayerId ?? null,
+    eliminatedPlayerId: room.eliminatedPlayerId ?? null,
+    loserId: room.loserId ?? null,
     finishedAt: room.finishedAt,
   };
 }
@@ -391,10 +432,12 @@ function broadcastRoomState(room) {
 function resetForRematch(room) {
   room.status = 'lobby';
   room.winnerId = null;
+  room.loserId = null;
   room.results = null;
   room.finishReason = null;
   room.resultReason = null;
   room.abandonedPlayerId = null;
+  room.eliminatedPlayerId = null;
   room.finishedAt = null;
   room.startedAt = null;
   for (const player of room.players.values()) {
@@ -402,6 +445,10 @@ function resetForRematch(room) {
     player.completed = false;
     player.completedAt = null;
     player.elapsedMs = null;
+    player.mistakes = 0;
+    player.maxMistakes = MAX_MISTAKES;
+    player.eliminated = false;
+    player.status = PLAYER_STATUS.PLAYING;
     player.progress.clear();
   }
 }
@@ -423,15 +470,22 @@ function startGame(room) {
   room.startedAt = now();
   room.finishedAt = null;
   room.winnerId = null;
+  room.loserId = null;
   room.results = null;
   room.finishReason = null;
   room.resultReason = null;
   room.abandonedPlayerId = null;
+  room.eliminatedPlayerId = null;
   for (const player of room.players.values()) {
     player.ready = false;
     player.completed = false;
     player.completedAt = null;
     player.elapsedMs = null;
+    // Every race starts clean: mistakes never carry across a rematch.
+    player.mistakes = 0;
+    player.maxMistakes = MAX_MISTAKES;
+    player.eliminated = false;
+    player.status = PLAYER_STATUS.PLAYING;
     player.progress.clear();
   }
 
@@ -453,8 +507,16 @@ function startGame(room) {
 /** Server decides everything here — the client only reports its board. */
 function handleCompletion(room, player, message) {
   const errors = [];
-  if (room.status !== 'playing') errors.push('game is not running');
+  const completedReason =
+    room.resultReason === RESULT_REASONS.PLAYER_COMPLETED ||
+    room.resultReason === RESULT_REASONS.PUZZLE_COMPLETED;
+  // A very close second finish arrives after the room is already finished; it
+  // is still recorded with its real server time (a race is not invalidated by
+  // losing it). Abandonment/elimination finishes do not accept late boards.
+  const lateFinish = room.status === 'finished' && completedReason;
+  if (room.status !== 'playing' && !lateFinish) errors.push('game is not running');
   if (player.completed) errors.push('already completed');
+  if (player.eliminated) errors.push('player is eliminated');
   if (message.puzzleId && message.puzzleId !== room.puzzleId) errors.push('puzzle id mismatch');
   const board = Array.isArray(message.board) ? message.board : null;
   if (!board || board.length !== 81) errors.push('board must have 81 cells');
@@ -501,17 +563,138 @@ function handleCompletion(room, player, message) {
 
   if (!room.winnerId) {
     room.winnerId = player.id;
-    finishGame(room, `First to finish: ${player.name}`);
+    finishGame(room, `First to finish: ${player.name}`, {
+      resultReason: RESULT_REASONS.PLAYER_COMPLETED,
+    });
   } else {
     // A very close second finish still gets recorded with its real server time,
     // and GAME_FINISHED is re-broadcast so both clients see both times.
-    finishGame(room, room.finishReason || 'Race finished');
+    finishGame(room, room.finishReason || 'Race finished', {
+      resultReason: RESULT_REASONS.PLAYER_COMPLETED,
+    });
   }
 }
 
-function finishGame(room, reason, { resultReason = RESULT_REASONS.PUZZLE_COMPLETED, abandonedPlayerId = null } = {}) {
+/**
+ * Server-authoritative move validation for a running race.
+ *
+ * The client only submits "cell X = value Y"; the server looks up its own
+ * solution, decides correctness and owns the mistake counter. On the third
+ * mistake the player is eliminated and the race is awarded to the opponent.
+ * The correct value is never sent back — a wrong answer only reports that it
+ * was wrong and how many attempts remain.
+ */
+function handlePlayerMove(room, player, message) {
+  const cell = Number(message.cell);
+  const value = Number(message.value);
+  const opponent = Array.from(room.players.values()).find((other) => other.id !== player.id) || null;
+
+  const reject = (code) =>
+    send(player.socket, {
+      type: MP.MOVE_RESULT,
+      accepted: false,
+      code,
+      cell: Number.isInteger(cell) ? cell : null,
+      value: null,
+      correct: false,
+      mistakes: player.mistakes,
+      remainingMistakes: Math.max(0, player.maxMistakes - player.mistakes),
+      maxMistakes: player.maxMistakes,
+      gameStatus: room.status,
+    });
+
+  if (room.status !== 'playing') return reject('GAME_NOT_RUNNING');
+  if (player.eliminated) return reject('ELIMINATED');
+  if (player.completed) return reject('ALREADY_COMPLETED');
+  if (!Number.isInteger(cell) || cell < 0 || cell > 80) return;
+  if (!Number.isInteger(value) || value < 0 || value > 9) return;
+  if (room.puzzle[cell] !== 0) return reject('CLUE_LOCKED'); // givens are immutable over the wire too
+
+  room.lastActivity = now();
+
+  // Deleting a number is never a mistake and is not validated against the solution.
+  if (value === 0) {
+    player.progress.delete(cell);
+    schedulePersist();
+    send(player.socket, moveResult(room, player, { cell, value: 0, correct: true }));
+    broadcastProgress(room, player.id, cell, 0);
+    return;
+  }
+
+  if (room.solution[cell] === value) {
+    player.progress.set(cell, value);
+    schedulePersist();
+    send(player.socket, moveResult(room, player, { cell, value, correct: true }));
+    broadcastProgress(room, player.id, cell, value);
+    return;
+  }
+
+  // Incorrect: increment the server-owned counter and tell the player only that
+  // the value was wrong. The solution is never revealed.
+  player.mistakes += 1;
+  player.progress.delete(cell);
+  schedulePersist();
+  send(player.socket, moveResult(room, player, { cell, value, correct: false }));
+  if (player.mistakes >= player.maxMistakes) eliminatePlayer(room, player, opponent);
+}
+
+/** The per-move reply carrying the authoritative mistake state. */
+function moveResult(room, player, { cell, value, correct }) {
+  return {
+    type: MP.MOVE_RESULT,
+    accepted: true,
+    correct,
+    cell,
+    value,
+    mistakes: player.mistakes,
+    remainingMistakes: Math.max(0, player.maxMistakes - player.mistakes),
+    maxMistakes: player.maxMistakes,
+    gameStatus: player.eliminated ? 'eliminated' : room.status,
+  };
+}
+
+function broadcastProgress(room, playerId, cell, value) {
+  broadcast(
+    room,
+    {
+      type: MP.PLAYER_PROGRESS,
+      roomId: room.id,
+      playerId,
+      cell,
+      value,
+      serverTimestamp: now(),
+    },
+    playerId,
+  );
+}
+
+/** Third mistake: the player is out, the opponent wins, deterministically. */
+function eliminatePlayer(room, player, opponent) {
+  if (player.eliminated) return;
+  player.eliminated = true;
+  player.status = PLAYER_STATUS.ELIMINATED;
+  room.winnerId = opponent ? opponent.id : null;
+  finishGame(room, `${player.name} reached the ${player.maxMistakes}-mistake limit`, {
+    resultReason: RESULT_REASONS.OPPONENT_MISTAKE_LIMIT,
+    eliminatedPlayerId: player.id,
+  });
+}
+
+function finishGame(
+  room,
+  reason,
+  { resultReason = RESULT_REASONS.PUZZLE_COMPLETED, abandonedPlayerId = null, eliminatedPlayerId = null } = {},
+) {
   room.resultReason = resultReason;
   room.abandonedPlayerId = abandonedPlayerId;
+  room.eliminatedPlayerId = eliminatedPlayerId;
+  // The loser is whoever did not win — stored explicitly for the result message.
+  if (room.winnerId) {
+    const other = Array.from(room.players.values()).find((player) => player.id !== room.winnerId);
+    room.loserId = other ? other.id : null;
+  } else {
+    room.loserId = null;
+  }
   if (room.status === 'finished' && room.results) {
     room.results = buildResults(room);
     room.finishReason = reason;
@@ -542,6 +725,10 @@ function buildResults(room) {
     elapsedMs: player.elapsedMs,
     completedAt: player.completedAt,
     connected: player.connected,
+    mistakes: player.mistakes,
+    maxMistakes: player.maxMistakes,
+    eliminated: player.eliminated,
+    status: player.status,
   }));
 }
 
@@ -550,10 +737,13 @@ function roomResultsMessage(room, reason) {
     roomId: room.id,
     puzzleId: room.puzzleId,
     winnerId: room.winnerId,
+    loserId: room.loserId ?? null,
     finishedAt: room.finishedAt,
     reason,
     resultReason: room.resultReason || RESULT_REASONS.PUZZLE_COMPLETED,
     abandonedPlayerId: room.abandonedPlayerId ?? null,
+    eliminatedPlayerId: room.eliminatedPlayerId ?? null,
+    maxMistakes: MAX_MISTAKES,
     results: room.results,
   };
 }
@@ -568,6 +758,10 @@ function playerPublic(player) {
     elapsedMs: player.elapsedMs,
     disconnectedAt: player.disconnectedAt,
     reconnectDeadline: player.reconnectDeadline,
+    mistakes: player.mistakes,
+    maxMistakes: player.maxMistakes,
+    eliminated: player.eliminated,
+    status: player.status,
   };
 }
 
@@ -655,7 +849,9 @@ function broadcastGameEnded(room) {
     reason: room.finishReason,
     resultReason: room.resultReason,
     abandonedPlayerId: room.abandonedPlayerId ?? null,
+    eliminatedPlayerId: room.eliminatedPlayerId ?? null,
     winnerId: room.winnerId,
+    loserId: room.loserId ?? null,
     finishedAt: room.finishedAt,
     results: room.results,
     serverTime: now(),
@@ -848,6 +1044,8 @@ wss.on('connection', (socket, request) => {
   socket.playerId = null;
   socket.messageCount = 0;
   socket.rateWindowStart = now();
+  socket.chatRateWindowStart = now();
+  socket.chatCountInWindow = 0;
   socket.isAlive = true;
   socket.on('pong', () => {
     socket.isAlive = true;
@@ -908,6 +1106,14 @@ function handleClientMessage(socket, message) {
   switch (message.type) {
     case MP.PING:
       send(socket, { type: MP.PONG, t: message.t, serverTime: now() });
+      break;
+
+    case MP.CHAT_MESSAGE:
+      handleChatMessage(socket, message);
+      break;
+
+    case MP.CHAT_HISTORY:
+      handleChatHistoryRequest(socket);
       break;
 
     case MP.CREATE_ROOM: {
@@ -1048,7 +1254,7 @@ function handleClientMessage(socket, message) {
         return;
       }
       const player = room.players.get(playerId);
-      if (room.status !== 'playing' || player.completed) return;
+      if (room.status !== 'playing' || player.completed || player.eliminated) return;
       const cell = Number(message.cell);
       const value = Number(message.value);
       if (!Number.isInteger(cell) || cell < 0 || cell > 80) return;
@@ -1071,6 +1277,18 @@ function handleClientMessage(socket, message) {
         },
         playerId,
       );
+      break;
+    }
+
+    case MP.PLAYER_MOVE: {
+      // Resolve membership from the socket itself: a client can never submit a
+      // move (or a mistake count) on behalf of the opponent.
+      const member = roomForSocket(socket);
+      if (!member) {
+        send(socket, { type: MP.ERROR, code: 'NOT_IN_ROOM', message: 'Not in that room' });
+        return;
+      }
+      handlePlayerMove(member.room, member.player, message);
       break;
     }
 
@@ -1122,6 +1340,92 @@ function handleClientMessage(socket, message) {
     default:
       send(socket, { type: MP.ERROR, code: 'UNKNOWN_TYPE', message: `Unknown message ${message.type}` });
   }
+}
+
+/* -------------------------------- chat ---------------------------------- */
+/*
+ * Chat rides the room WebSocket. Identity and room membership are always
+ * resolved from the socket itself (set on CREATE_ROOM / JOIN_ROOM) — never
+ * from client-supplied fields — and every accepted message is stamped and
+ * ordered by the server before it is broadcast to the whole room.
+ */
+
+/** The socket's own room + player, or null when it is not an authenticated member. */
+function roomForSocket(socket) {
+  const room = socket.roomId ? rooms.get(socket.roomId) : null;
+  const player = room?.players.get(socket.playerId);
+  if (!room || !player || player.socket !== socket) return null;
+  return { room, player };
+}
+
+function sanitizeChatMessage(raw) {
+  if (typeof raw !== 'string') return null;
+  // HTML is never interpreted anywhere (clients render textContent only), but
+  // control characters are still stripped so a message cannot fake UI chrome.
+  const cleaned = raw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+  const trimmed = cleaned.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > MAX_CHAT_LENGTH) return null;
+  return trimmed;
+}
+
+/** Sliding 1-second per-socket window; hard ceiling of MAX_CHAT_PER_SECOND. */
+function isChatRateLimited(socket) {
+  const stamp = now();
+  if (stamp - socket.chatRateWindowStart > CHAT_RATE_WINDOW_MS) {
+    socket.chatRateWindowStart = stamp;
+    socket.chatCountInWindow = 0;
+  }
+  if (socket.chatCountInWindow >= MAX_CHAT_PER_SECOND) return true;
+  socket.chatCountInWindow++;
+  return false;
+}
+
+function handleChatMessage(socket, message) {
+  const member = roomForSocket(socket);
+  if (!member) {
+    send(socket, { type: MP.CHAT_ERROR, code: 'NOT_IN_ROOM', message: 'Chat is not available here.' });
+    return;
+  }
+  if (isChatRateLimited(socket)) {
+    send(socket, { type: MP.ERROR, code: 'CHAT_RATE_LIMITED', message: 'You are sending messages too quickly.' });
+    return;
+  }
+  const content = sanitizeChatMessage(message.message);
+  if (!content) {
+    send(socket, {
+      type: MP.CHAT_ERROR,
+      code: 'INVALID_MESSAGE',
+      message: `Messages must be 1–${MAX_CHAT_LENGTH} characters of text.`,
+    });
+    return;
+  }
+
+  const { room, player } = member;
+  const entry = {
+    playerId: player.id,
+    playerName: player.name, // server-authoritative name, never the client's claim
+    message: content,
+    timestamp: now(), // server-authoritative ordering
+  };
+  room.chatHistory.push(entry);
+  if (room.chatHistory.length > MAX_CHAT_HISTORY) room.chatHistory.shift();
+  room.lastActivity = now();
+  schedulePersist();
+  broadcast(room, { type: MP.CHAT_MESSAGE, ...entry });
+}
+
+function handleChatHistoryRequest(socket) {
+  const member = roomForSocket(socket);
+  if (!member) {
+    send(socket, { type: MP.CHAT_ERROR, code: 'NOT_IN_ROOM', message: 'Chat is not available here.' });
+    return;
+  }
+  send(socket, {
+    type: MP.CHAT_HISTORY,
+    roomId: member.room.id,
+    messages: member.room.chatHistory.slice(-MAX_CHAT_HISTORY),
+  });
 }
 
 /* ------------------------------- upkeep --------------------------------- */

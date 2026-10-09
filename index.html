@@ -74,12 +74,13 @@
               <span class="timer-label">TIME</span>
               <span id="game-timer" class="timer" aria-live="off">00:00</span>
             </div>
-          </header>
+          </header>          <p id="mistake-flash" class="mistake-flash" role="status" aria-live="assertive" hidden></p>
 
           <div id="mp-hud" class="mp-hud" hidden>
             <div class="mp-player" id="mp-you">
               <span class="mp-name">YOU</span>
               <span id="mp-you-time" class="timer">00:00</span>
+              <span id="mp-you-mistakes" class="mp-mistakes" hidden>⚠ Mistakes 0/3</span>
               <div class="progress" role="img" aria-label="Your progress">
                 <div id="mp-you-bar" class="progress-bar"></div>
               </div>
@@ -129,6 +130,60 @@
             <button class="btn" type="button" data-action="pause" aria-label="Pause game">
               ⏸ Pause
             </button>
+          </div>
+
+          <!-- Multiplayer chat: desktop side panel (CSS hides this one on phones). -->
+          <aside class="chat-panel" id="chat-panel" hidden aria-label="Multiplayer chat">
+            <div class="chat-panel-inner">
+              <div class="chat-panel-head">
+                <h3 class="chat-panel-title">Chat</h3>
+                <span class="chat-status" id="chat-status" aria-live="polite" hidden></span>
+              </div>
+              <div class="chat-messages" id="chat-messages" aria-live="polite"></div>
+              <div class="chat-input-row">
+                <input
+                  id="chat-input"
+                  type="text"
+                  maxlength="250"
+                  placeholder="Type a message…"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="Chat message"
+                  class="chat-input"
+                />
+                <button class="btn btn-primary btn-sm" type="button" id="chat-send" disabled aria-label="Send message">
+                  ➤
+                </button>
+              </div>
+            </div>
+          </aside>
+
+          <!-- Mobile chat: compact button + bottom sheet (hidden on desktop widths). -->
+          <button class="chat-btn" id="chat-btn" type="button" data-action="open-chat" hidden aria-label="Open chat">
+            💬 Chat<span class="chat-badge" id="chat-badge" hidden></span>
+          </button>
+
+          <div id="chat-mobile-panel" class="chat-mobile-panel" hidden aria-label="Chat">
+            <div class="chat-mobile-head">
+              <h3 class="chat-mobile-title">Chat</h3>
+              <button class="btn btn-ghost btn-sm" type="button" data-action="close-chat" id="chat-mobile-close" aria-label="Close chat">✕</button>
+            </div>
+            <div class="chat-mobile-status" id="chat-mobile-status" hidden></div>
+            <div class="chat-mobile-messages" id="chat-mobile-messages" aria-live="polite"></div>
+            <div class="chat-mobile-input-row">
+              <input
+                id="chat-mobile-input"
+                type="text"
+                maxlength="250"
+                placeholder="Type a message…"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="Chat message"
+              />
+              <button class="btn btn-primary btn-sm" type="button" id="chat-mobile-send" disabled aria-label="Send message">
+                Send
+              </button>
+            </div>
           </div>
         </section>
 

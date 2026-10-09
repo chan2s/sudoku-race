@@ -35,7 +35,8 @@ export class UI {
     this.room = null;
     this.connection = { state: CONNECTION_STATE.IDLE, message: '' };
     this.opponent = { name: 'OPPONENT', progress: 0, timeMs: 0, done: false, away: false, left: false };
-    this.you = { progress: 0, done: false, timeMs: 0 };
+    this.you = { progress: 0, done: false, timeMs: 0, mistakes: 0, maxMistakes: 3, eliminated: false };
+    this.mistakeFlashTimer = null;
     this.disconnectCountdown = null; // { name, deadline, serverNow } while the opponent is away
     this.serverOffsetMs = 0;
     this.currentScreen = 'home';
@@ -60,6 +61,8 @@ export class UI {
       mistakes: $('game-mistakes'),
       mpHud: $('mp-hud'),
       mpYouTime: $('mp-you-time'),
+      mpYouMistakes: $('mp-you-mistakes'),
+      mistakeFlash: $('mistake-flash'),
       mpOppTime: $('mp-opp-time'),
       mpYouBar: $('mp-you-bar'),
       mpOppBar: $('mp-opp-bar'),
@@ -90,6 +93,22 @@ export class UI {
       mpDifficulty: $('mp-difficulty'),
       mpJoinForm: $('mp-join-form'),
       mpRoomCode: $('mp-room-code'),
+      // chat
+      chatPanel: $('chat-panel'),
+      chatStatus: $('chat-status'),
+      chatMessages: $('chat-messages'),
+      chatNewCue: $('chat-new-cue'),
+      chatInput: $('chat-input'),
+      chatSend: $('chat-send'),
+      chatBtn: $('chat-btn'),
+      chatBadge: $('chat-badge'),
+      chatMobilePanel: $('chat-mobile-panel'),
+      chatMobileStatus: $('chat-mobile-status'),
+      chatMobileMessages: $('chat-mobile-messages'),
+      chatMobileInput: $('chat-mobile-input'),
+      chatMobileSend: $('chat-mobile-send'),
+      chatMobileClose: $('chat-mobile-close'),
+      chatMobileBadge: $('chat-badge'),
       settings: {
         name: $('set-name'),
         mistakes: $('set-mistakes'),
@@ -229,6 +248,12 @@ export class UI {
       case 'copy-room':
         this.copyRoomCode();
         break;
+      case 'open-chat':
+        this.handlers.onOpenChat?.();
+        break;
+      case 'close-chat':
+        this.handlers.onCloseChat?.();
+        break;
       case 'save-settings':
         this.handlers.onSaveSettings?.(this.readSettingsForm());
         break;
@@ -251,6 +276,9 @@ export class UI {
     document.addEventListener('keydown', (event) => {
       const tag = event.target?.tagName;
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      // Chat surfaces own their keys: a focused send button or anything inside
+      // the chat panels must never pause the race or edit a Sudoku cell.
+      if (event.target?.closest?.('#chat-panel, #chat-mobile-panel, #chat-btn')) return;
       if (this.currentScreen !== 'game' || !this.engine) return;
       const key = event.key;
 
@@ -356,7 +384,9 @@ export class UI {
     }
     if (mistakes) {
       const limited = engine.mistakeLimit !== Infinity && engine.mistakeLimit > 0;
-      mistakes.hidden = !limited;
+      // Multiplayer shows mistakes in the player card next to the clock; the
+      // header pill is the single-player surface for the same rule.
+      mistakes.hidden = !limited || engine.mode === 'multiplayer';
       mistakes.textContent = `Mistakes ${engine.mistakes}/${engine.mistakeLimit}`;
     }
     if (this.elements.mpHud) this.elements.mpHud.hidden = engine.mode !== 'multiplayer';
@@ -413,11 +443,15 @@ export class UI {
     const { mpYouTime, mpOppTime, mpYouBar, mpOppBar, mpYouStatus, mpOppStatus, mpOppName } = this.elements;
     if (!engine || !mpYouTime) return;
 
-    const myStatus = this.you.done ? 'Finished' : engine.status === GAME_STATUS.PAUSED ? 'Paused' : 'Solving';
+    let myStatus = 'Solving';
+    if (this.you.eliminated) myStatus = 'Eliminated';
+    else if (this.you.done) myStatus = 'Finished';
+    else if (engine.status === GAME_STATUS.PAUSED) myStatus = 'Paused';
     mpYouTime.textContent = formatTime(this.you.done && this.you.finalMs ? this.you.finalMs : engine.elapsedMs);
     mpYouStatus.textContent = `● ${myStatus}`;
-    mpYouStatus.className = `mp-status${this.you.done ? ' is-done' : ''}`;
+    mpYouStatus.className = `mp-status${this.you.done ? ' is-done' : ''}${this.you.eliminated ? ' is-away' : ''}`;
     if (mpYouBar) mpYouBar.style.width = `${Math.round(this.you.progress * 100)}%`;
+    this.renderMistakes();
 
     const opponentTime = this.opponent.done && this.opponent.finalMs ? this.opponent.finalMs : this.opponentTimeMs();
     if (mpOppTime) mpOppTime.textContent = formatTime(opponentTime);
@@ -443,6 +477,47 @@ export class UI {
     youPanel?.classList.add('is-you');
     youPanel?.classList.toggle('is-done', this.you.done);
     this.elements.mpHud?.querySelector('#mp-opponent')?.classList.toggle('is-done', this.opponent.done);
+  }
+
+  /**
+   * "⚠ Mistakes 1/3" next to the player's own clock. Hidden for unlimited or
+   * single-player games. The counter only ever reflects the server's value in
+   * a race (applied by the engine), so a tampered client cannot move it.
+   */
+  renderMistakes() {
+    const el = this.elements.mpYouMistakes;
+    if (!el) return;
+    const engine = this.engine;
+    const limited = Boolean(engine) && engine.mode === 'multiplayer' && engine.mistakeLimit !== Infinity;
+    if (!limited) {
+      el.hidden = true;
+      return;
+    }
+    const max = engine.mistakeLimit;
+    const count = Math.min(engine.mistakes, max);
+    el.hidden = false;
+    el.textContent = `⚠ Mistakes ${count} / ${max}`;
+    el.classList.toggle('is-warning', count > 0 && count < max);
+    el.classList.toggle('is-danger', count >= max);
+  }
+
+  /**
+   * Short, self-clearing mistake feedback ("⚠ Incorrect / Mistakes 1/3"). It is
+   * an aria-live region and never blocks the board.
+   */
+  showMistakeFeedback(count, max, { final = false } = {}) {
+    const el = this.elements.mistakeFlash;
+    if (!el) return;
+    el.textContent = final
+      ? `Incorrect! That's ${count} / ${max} — maximum mistakes reached.`
+      : `⚠ Incorrect!   Mistakes: ${count} / ${max}`;
+    el.classList.toggle('is-final', final);
+    el.hidden = false;
+    clearTimeout(this.mistakeFlashTimer);
+    this.mistakeFlashTimer = window.setTimeout(() => {
+      el.hidden = true;
+      el.classList.remove('is-final');
+    }, final ? 3200 : 1800);
   }
 
   opponentTimeMs() {
@@ -776,28 +851,54 @@ export class UI {
     element.textContent = formatTime(remaining);
   }
 
-  setYou({ progress, done, finalMs } = {}) {
+  setYou({ progress, done, finalMs, mistakes, maxMistakes, eliminated } = {}) {
     if (progress !== undefined) this.you.progress = progress;
     if (done !== undefined) this.you.done = done;
     if (finalMs !== undefined) this.you.finalMs = finalMs ?? undefined;
+    if (mistakes !== undefined) this.you.mistakes = mistakes;
+    if (maxMistakes !== undefined) this.you.maxMistakes = maxMistakes;
+    if (eliminated !== undefined) this.you.eliminated = eliminated;
     this.renderMultiplayerHud();
   }
 
   /** Clears all multiplayer HUD state when leaving a room. */
   resetOpponent() {
     this.opponent = { name: 'OPPONENT', progress: 0, timeMs: 0, done: false, away: false, left: false };
-    this.you = { progress: 0, done: false, timeMs: 0 };
+    this.you = { progress: 0, done: false, timeMs: 0, mistakes: 0, maxMistakes: 3, eliminated: false };
+    this.hideMistakeFeedback();
     this.hideDisconnectCountdown();
     this.renderMultiplayerHud();
   }
 
-  showResult({ winnerId, youId, results = [], reason = '', resultReason = '', abandonedPlayerId = null }) {
+  hideMistakeFeedback() {
+    clearTimeout(this.mistakeFlashTimer);
+    if (this.elements.mistakeFlash) {
+      this.elements.mistakeFlash.hidden = true;
+      this.elements.mistakeFlash.classList.remove('is-final');
+    }
+  }
+
+  showResult({
+    winnerId,
+    youId,
+    results = [],
+    reason = '',
+    resultReason = '',
+    abandonedPlayerId = null,
+    eliminatedPlayerId = null,
+  }) {
     const youWon = winnerId && winnerId === youId;
     const draw = !winnerId;
     const byAbandonment = resultReason === 'OPPONENT_ABANDONED' || resultReason === 'PLAYER_ABANDONED';
+    const byMistakeLimit = resultReason === 'OPPONENT_MISTAKE_LIMIT';
+    const max = this.engine?.mistakeLimit && this.engine.mistakeLimit !== Infinity ? this.engine.mistakeLimit : 3;
+    const mistakes = this.engine?.mistakes ?? 0;
     const describe = (result) => {
+      if (byMistakeLimit && result.eliminated) {
+        return `${result.name || 'Player'} — reached the ${result.maxMistakes || max}-mistake limit`;
+      }
       if (byAbandonment && !result.completed) {
-        const lost = result.playerId && result.playerId === abandonedPlayerId;
+        const lost = result.playerId && result.playerId === (eliminatedPlayerId || abandonedPlayerId);
         return `${result.name || 'Player'} — ${lost ? 'abandoned' : 'did not finish'}`;
       }
       return `${result.name || 'Player'} — ${
@@ -805,6 +906,22 @@ export class UI {
       }`;
     };
     const lines = results.map(describe).join('  ·  ');
+
+    // The mistake-limit loss has its own, explicit copy on both sides.
+    if (byMistakeLimit) {
+      this.showOverlay({
+        title: youWon ? 'YOU WIN' : 'GAME OVER',
+        text: youWon
+          ? `Your opponent reached the ${max}-mistake limit.  Reason: Opponent reached mistake limit.`
+          : `You reached the maximum number of mistakes.  Mistakes: ${mistakes} / ${max}  Your opponent wins.`,
+        actions: [
+          { label: 'Back to lobby', action: 'go-multiplayer', variant: 'btn-primary' },
+          { label: 'Single player', action: 'quit-game' },
+        ],
+      });
+      return;
+    }
+
     this.showOverlay({
       title: draw ? 'Race finished' : youWon ? 'You win! 🏆' : 'You lost this time',
       text: `${reason ? `${reason} ` : ''}${lines}`.trim() || 'No result recorded.',

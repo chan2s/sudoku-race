@@ -188,15 +188,24 @@ Client → server:
 | `PLAYER_READY` | ready toggle for the lobby / rematch |
 | `START_GAME` | explicit start (also automatic when both are ready) |
 | `PLAYER_PROGRESS` | one cell changed (`{cell, value, timestamp}`) |
+| `PLAYER_MOVE` | one cell submitted for validation (`{cell, value}`) — the server decides correctness |
 | `PLAYER_COMPLETED` | finished board (`{board, clientTimestamp}`) — the timestamp is advisory only |
 | `REQUEST_STATE` | ask for the authoritative snapshot (sent on reconnect) |
 | `LEAVE_ROOM` / `PING` | leave the table / keepalive |
 
 Server → client: `ROOM_CREATED`, `ROOM_STATE`, `PLAYER_JOINED`, `PLAYER_LEFT`, `PLAYER_READY`,
-`GAME_STARTED`, `PROGRESS_STATE`, `PLAYER_PROGRESS`, `PLAYER_COMPLETED`, `PLAYER_DISCONNECTED`,
-`PLAYER_RECONNECTED`, `GAME_FINISHED`, `PONG`, `ERROR` (`ROOM_NOT_FOUND`, `ROOM_FULL`,
-`ROOM_IN_PROGRESS`, `INVALID_SOLUTION`, `NOT_IN_ROOM`, `RATE_LIMITED`, `INVALID_PLAYER`,
-`UNKNOWN_TYPE`).
+`GAME_STARTED`, `PROGRESS_STATE`, `PLAYER_PROGRESS`, `MOVE_RESULT`, `PLAYER_COMPLETED`,
+`PLAYER_DISCONNECTED`, `PLAYER_RECONNECTED`, `GAME_FINISHED`, `GAME_ENDED`, `PONG`, `ERROR`
+(`ROOM_NOT_FOUND`, `ROOM_FULL`, `ROOM_IN_PROGRESS`, `INVALID_SOLUTION`, `NOT_IN_ROOM`,
+`RATE_LIMITED`, `INVALID_PLAYER`, `UNKNOWN_TYPE`).
+
+Every cell entry is validated by the server, which replies with its verdict and the
+authoritative mistake count — the correct value is never sent back:
+
+```json
+{ "type": "PLAYER_MOVE", "cell": 42, "value": 7 }
+{ "type": "MOVE_RESULT", "correct": false, "cell": 42, "value": 7, "mistakes": 1, "remainingMistakes": 2, "maxMistakes": 3 }
+```
 
 Progress is event-based and throttled by design — one small message per changed cell, never a whole
 board stream:
@@ -236,7 +245,28 @@ Invalid submissions produce `ERROR INVALID_SOLUTION` and are logged — no resul
 `clientTimestamp` values are ignored entirely, so a hacked clock or a fake `{winner: true}` message
 changes nothing (`WINNER` is not even a known message type; unknown types are rejected explicitly).
 
-### 4.5 Sync API (optional)
+### 4.5 Mistake limit
+
+A race also ends when a player makes **3 mistakes**. Every entered value is validated against the
+server's own solution; an incorrect one increments that player's server-owned `mistakes` counter
+(never a client-supplied value) and the client is told only *that* it was wrong. The third mistake
+marks the player `eliminated`, awards the win to the opponent and broadcasts `GAME_FINISHED`:
+
+```json
+{ "type": "GAME_FINISHED", "winnerId": "player-2", "loserId": "player-1", "reason": "OPPONENT_MISTAKE_LIMIT" }
+```
+
+* Selecting a cell, erasing, navigating and entering the correct number are never mistakes.
+* Correct answers keep contributing to completion; deleting a value is never a mistake.
+* After elimination the loser's input is disabled and further `PLAYER_MOVE`s are rejected; the clock
+  stops and completion submissions are refused.
+* The mistake count lives in the room state (and on disk), so it survives a disconnect, a refresh or
+  a server restart along with the puzzle and the original timer.
+* Chat stays on the same room WebSocket and remains usable after the race ends.
+* Explicit result reasons are stored with every finish: `PLAYER_COMPLETED`, `OPPONENT_COMPLETED`,
+  `OPPONENT_MISTAKE_LIMIT` and `OPPONENT_ABANDONED`.
+
+### 4.6 Sync API (optional)
 
 `POST /api/sync` accepts one record `{ id, type, payload, createdAt, updatedAt }` and returns
 `{ ok, duplicate, stored, stats }`. Records are idempotent by id, so retries after a flaky connection
@@ -281,13 +311,13 @@ npm run smoke     # real browser: gameplay, refresh, offline, sync, two-tab race
 | --- | --- | --- |
 | `tools/test-standalone.mjs` | 6 | the frontend on a plain static host (`/api` and `/ws` return 404): the game starts, plays, keeps its timer, survives a sync failure, restores after a reload and degrades gracefully on the multiplayer screen — i.e. **the Sudoku game works without the backend** |
 | `tools/test-sudoku.mjs` | 35 | unique solutions, solver agreement, clue bands, deterministic seeds, duplicate detection, timer pause/refresh, engine rules (givens, mistakes, undo, pause, restart, completion, serialization, corruption), StorageManager round-trips and the sync queue |
-| `tools/test-multiplayer.mjs` | 25 | server boot, static hosting, path-traversal blocking, room create/join/full/not-found, state relay to both players, identical seeded puzzle, progress relay without echo, clue tampering, **server-decided winner**, late finisher, rematch, cheat rejection, reconnect with replay, sync idempotency, abandonment, rate limiting |
-| `tools/browser-smoke.mjs` | 27 | headless Chrome through the real UI: board/a11y, timer, mouse+keyboard play, peers, givens, mistakes/undo, pause, **refresh continuity**, **offline play**, **offline reload via service worker**, queue drain → `✓ Synced`, completion + stats, **two-tab race with an identical puzzle and an authoritative winner**, opponent drop/rejoin, lobby leave, 390×844 layout, zero console errors |
+| `tools/test-multiplayer.mjs` | 29 | server boot, static hosting, path-traversal blocking, room create/join/full/not-found, state relay to both players, identical seeded puzzle, progress relay without echo, clue tampering, **server-decided winner**, late finisher, rematch, cheat rejection, reconnect with replay, **3-mistake elimination + `OPPONENT_MISTAKE_LIMIT` + rejected post-game move + client-manipulation rejection + mistake persistence across reconnect**, sync idempotency, abandonment, rate limiting |
+| `tools/browser-smoke.mjs` | 28 | headless Chrome through the real UI: board/a11y, timer, mouse+keyboard play, peers, givens, mistakes/undo, pause, **refresh continuity**, **offline play**, **offline reload via service worker**, queue drain → `✓ Synced`, completion + stats, **two-tab race with an identical puzzle and an authoritative winner**, **3-mistake elimination with the game-over/you-win overlays and chat still open**, opponent drop/rejoin, lobby leave, 390×844 layout, zero console errors |
 
 The suites were written before/while building and each failure was investigated rather than relaxed;
 screenshots from the browser run land in `tools/screenshots/`.
 
-All three suites are green: **93 checks (35 + 25 + 6 + 27), 0 failures, 0 browser console errors.**
+All three suites are green: **98 checks (35 + 29 + 6 + 28), 0 failures, 0 browser console errors.**
 
 Known limits (honest list):
 

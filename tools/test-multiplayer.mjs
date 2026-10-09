@@ -401,6 +401,126 @@ try {
     outsider.close();
   });
 
+  /* ---------------------------- mistake limit --------------------------- */
+
+  console.log('\nMISTAKE LIMIT');
+
+  async function startRacePair(idA, idB, difficulty = 'easy') {
+    const a = makeClient(idA, idA);
+    const b = makeClient(idB, idB);
+    await a.connect();
+    await b.connect();
+    a.send({ type: MP.CREATE_ROOM, name: idA, difficulty });
+    const created = await a.waitFor(MP.ROOM_CREATED);
+    b.send({ type: MP.JOIN_ROOM, roomId: created.room.code, name: idB });
+    await b.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.length === 2 });
+    a.clear();
+    b.clear();
+    a.send({ type: MP.PLAYER_READY, roomId: created.room.code, ready: true });
+    b.send({ type: MP.PLAYER_READY, roomId: created.room.code, ready: true });
+    const started = await a.waitFor(MP.GAME_STARTED);
+    await b.waitFor(MP.GAME_STARTED);
+    const derived = generatePuzzle(started.difficulty, started.seed);
+    const empties = derived.puzzle.map((value, index) => (value === 0 ? index : -1)).filter((i) => i >= 0);
+    return { a, b, code: created.room.code, started, solution: derived.solution, empties };
+  }
+
+  const wrongValue = (solution, cell) => (solution[cell] === 9 ? 1 : solution[cell] + 1);
+
+  await test('a correct move never increases the mistake count', async () => {
+    const { a, b, code, solution, empties } = await startRacePair('mk-ok-a', 'mk-ok-b');
+    const cell = empties[0];
+    a.send({ type: MP.PLAYER_MOVE, roomId: code, cell, value: solution[cell] });
+    const result = await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.cell === cell });
+    assert.equal(result.accepted, true);
+    assert.equal(result.correct, true);
+    assert.equal(result.mistakes, 0);
+    assert.equal(result.remainingMistakes, 3);
+    assert.equal(result.correctValue, undefined, 'the solution is never sent to the client');
+    a.close();
+    b.close();
+  });
+
+  await test('three incorrect moves eliminate the player and hand the win to the opponent', async () => {
+    const { a, b, code, solution, empties } = await startRacePair('mk-limit-a', 'mk-limit-b');
+    for (let i = 0; i < 3; i++) {
+      const cell = empties[i];
+      a.clear();
+      a.send({ type: MP.PLAYER_MOVE, roomId: code, cell, value: wrongValue(solution, cell) });
+      const result = await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.cell === cell });
+      assert.equal(result.correct, false);
+      assert.equal(result.mistakes, i + 1, `mistake ${i + 1} of 3`);
+      assert.equal(result.remainingMistakes, 2 - i);
+      assert.equal(result.correctValue, undefined, 'the right answer is never revealed');
+    }
+    const finishedForA = await a.waitFor(MP.GAME_FINISHED);
+    const finishedForB = await b.waitFor(MP.GAME_FINISHED);
+    assert.equal(finishedForA.winnerId, 'mk-limit-b', 'the opponent wins');
+    assert.equal(finishedForA.loserId, 'mk-limit-a');
+    assert.equal(finishedForA.resultReason, 'OPPONENT_MISTAKE_LIMIT');
+    assert.equal(finishedForB.resultReason, 'OPPONENT_MISTAKE_LIMIT', 'both players get the result');
+    const loser = finishedForA.results.find((result) => result.playerId === 'mk-limit-a');
+    assert.equal(loser.eliminated, true);
+    assert.equal(loser.mistakes, 3);
+
+    // A post-game move from the eliminated player is refused.
+    a.clear();
+    const nextCell = empties[3];
+    a.send({ type: MP.PLAYER_MOVE, roomId: code, cell: nextCell, value: solution[nextCell] });
+    const rejected = await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.accepted === false });
+    assert.equal(rejected.accepted, false);
+    assert.equal(rejected.mistakes, 3, 'the mistake count does not change after elimination');
+    a.close();
+    b.close();
+  });
+
+  await test('a client cannot manipulate its own mistake count', async () => {
+    const { a, b, code, solution, empties } = await startRacePair('mk-cheat-a', 'mk-cheat-b');
+    a.send({ type: MP.PLAYER_MOVE, roomId: code, cell: empties[0], value: wrongValue(solution, empties[0]) });
+    const first = await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.cell === empties[0] });
+    assert.equal(first.mistakes, 1);
+
+    // Claiming a clean slate has no effect: the server owns the counter.
+    const cell = empties[1];
+    a.send({
+      type: MP.PLAYER_MOVE,
+      roomId: code,
+      cell,
+      value: solution[cell],
+      mistakes: 0,
+      remainingMistakes: 3,
+    });
+    const result = await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.cell === cell });
+    assert.equal(result.correct, true);
+    assert.equal(result.mistakes, 1, 'client-supplied mistakes are ignored');
+    assert.equal(result.remainingMistakes, 2);
+    a.close();
+    b.close();
+  });
+
+  await test('mistakes survive a disconnect and reconnect', async () => {
+    const { a, b, code, solution, empties } = await startRacePair('mk-recon-a', 'mk-recon-b');
+    for (let i = 0; i < 2; i++) {
+      const cell = empties[i];
+      a.clear();
+      a.send({ type: MP.PLAYER_MOVE, roomId: code, cell, value: wrongValue(solution, cell) });
+      await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.cell === cell });
+    }
+    a.close();
+    await b.waitFor(MP.PLAYER_DISCONNECTED, { predicate: (message) => message.player.id === 'mk-recon-a' });
+
+    const a2 = makeClient('mk-recon-a', 'mk-recon-a');
+    await a2.connect();
+    a2.send({ type: MP.JOIN_ROOM, roomId: code, name: 'mk-recon-a' });
+    const state = await a2.waitFor(MP.ROOM_STATE, { predicate: (message) => Boolean(message.game) });
+    const me = state.room.players.find((player) => player.id === 'mk-recon-a');
+    assert.equal(me.mistakes, 2, 'the mistake count is preserved across the reconnect');
+    assert.equal(me.maxMistakes, 3);
+    assert.equal(state.game.status, 'playing', 'the race is still running');
+    a2.close();
+    b.close();
+  });
+
   /* --------------------------- disconnections --------------------------- */
 
   console.log('\nDISCONNECTION HANDLING');

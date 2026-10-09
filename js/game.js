@@ -15,6 +15,9 @@ export const GAME_STATUS = {
   PAUSED: 'paused',
   COMPLETED: 'completed',
   FAILED: 'failed',
+  // A multiplayer race the *server* decided: the board is locked, the clock is
+  // stopped and the result overlay is owned by the app, not this engine.
+  FINISHED: 'finished',
 };
 
 /** Minimal event emitter so the engine stays dependency-free. */
@@ -83,6 +86,7 @@ export class GameEngine extends Emitter {
       status = null,
       board = null,
       mistakes = 0,
+      eliminated = false,
       undoStack = [],
       wrongCells = [],
       timerState = null,
@@ -114,6 +118,7 @@ export class GameEngine extends Emitter {
     }
     this.mistakeLimit = Number.isFinite(mistakeLimit) && mistakeLimit > 0 ? mistakeLimit : Infinity;
     this.mistakes = Number(mistakes) || 0;
+    this.eliminated = Boolean(eliminated);
     this.wrongCells = new Set(wrongCells.filter((index) => this.board[index] && this.board[index] !== this.solution[index]));
     this.undoStack = Array.isArray(undoStack) ? undoStack.slice(-MAX_UNDO) : [];
     this.selectedIndex = null;
@@ -129,7 +134,11 @@ export class GameEngine extends Emitter {
       timerState ||
         timer || { running: this.status === GAME_STATUS.PLAYING, accumulatedMs: 0, startedAt: Date.now() },
     );
-    if (this.status === GAME_STATUS.COMPLETED || this.status === GAME_STATUS.FAILED) {
+    if (
+      this.status === GAME_STATUS.COMPLETED ||
+      this.status === GAME_STATUS.FAILED ||
+      this.status === GAME_STATUS.FINISHED
+    ) {
       this.timer.stop();
     }
   }
@@ -203,6 +212,14 @@ export class GameEngine extends Emitter {
     return this.status !== GAME_STATUS.PLAYING;
   }
 
+  /**
+   * In a multiplayer race the server owns the mistake counter and the
+   * elimination rule — the client only renders what the server reports.
+   */
+  get countsMistakes() {
+    return this.mode !== 'multiplayer';
+  }
+
   isWrong(index) {
     return this.wrongCells.has(index);
   }
@@ -252,21 +269,77 @@ export class GameEngine extends Emitter {
       this.emit('value', { index, value: next, previous, correct: true, remote });
     } else {
       this.wrongCells.add(index);
-      this.mistakes += 1;
-      result.mistake = { index, value: next, mistakes: this.mistakes };
+      // Multiplayer: flag the cell for immediate feedback, but never count the
+      // mistake or end the game locally — the server decides both.
+      if (this.countsMistakes) {
+        this.mistakes += 1;
+        result.mistake = { index, value: next, mistakes: this.mistakes };
+        this.emit('mistake', result.mistake);
+      }
       this.emit('value', { index, value: next, previous, correct: false, remote });
-      this.emit('mistake', result.mistake);
     }
 
     this.updatedAt = Date.now();
     this.emit('change', { reason: 'value', index });
 
-    if (this.mistakes >= this.mistakeLimit && this.mistakeLimit !== Infinity) {
+    if (this.countsMistakes && this.mistakes >= this.mistakeLimit && this.mistakeLimit !== Infinity) {
       this.fail('too-many-mistakes');
       return result;
     }
     this.checkCompletion();
     return result;
+  }
+
+  /**
+   * Applies the server's verdict for a multiplayer move. The board was already
+   * updated optimistically; this reconciles the authoritative mistake count,
+   * the wrong-cell marker and the mistake feedback. The server is the only
+   * source of `correct` and `mistakes`.
+   */
+  applyServerMove(message) {
+    if (this.mode !== 'multiplayer') return false;
+    if (!message || message.accepted === false) return false;
+    const cell = Number(message.cell);
+    const value = Number(message.value) || 0;
+    if (!Number.isInteger(cell) || cell < 0 || cell >= CELLS) return false;
+    const previous = this.board[cell];
+    this.board[cell] = value;
+    if (!value || message.correct) this.wrongCells.delete(cell);
+    else this.wrongCells.add(cell);
+    if (Number.isFinite(Number(message.mistakes))) this.mistakes = Number(message.mistakes);
+    if (Number.isFinite(Number(message.maxMistakes)) && Number(message.maxMistakes) > 0) {
+      this.mistakeLimit = Number(message.maxMistakes);
+    }
+    this.updatedAt = Date.now();
+    this.emit('value', { index: cell, value, previous, correct: Boolean(message.correct), remote: true });
+    if (value && !message.correct) {
+      this.emit('mistake', {
+        index: cell,
+        value,
+        mistakes: this.mistakes,
+        remaining:
+          this.mistakeLimit === Infinity ? 0 : Math.max(0, this.mistakeLimit - this.mistakes),
+        serverAuthoritative: true,
+      });
+    }
+    this.emit('change', { reason: 'value', index: cell });
+    if (value && message.correct && this.status === GAME_STATUS.PLAYING) this.checkCompletion();
+    return true;
+  }
+
+  /**
+   * Locks a multiplayer race whose result the server has already decided. The
+   * board and clock stop; the winner/loser overlay is rendered by the app.
+   */
+  finishRace({ eliminated = false } = {}) {
+    if (this.mode !== 'multiplayer') return;
+    this.timer.stop();
+    this.eliminated = Boolean(eliminated);
+    if (this.status === GAME_STATUS.PLAYING || this.status === GAME_STATUS.PAUSED) {
+      this.status = GAME_STATUS.FINISHED;
+      this.emit('status', { status: this.status });
+      this.emit('change', { reason: 'finished' });
+    }
   }
 
   /** Value currently shown in a cell (used by the eraser and by multiplayer sync). */
@@ -375,6 +448,7 @@ export class GameEngine extends Emitter {
       board: this.board.slice(),
       status: this.status,
       mistakes: this.mistakes,
+      eliminated: this.eliminated,
       mistakeLimit: this.mistakeLimit === Infinity ? 0 : this.mistakeLimit,
       wrongCells: Array.from(this.wrongCells),
       undoStack: this.undoStack.slice(-MAX_UNDO),
