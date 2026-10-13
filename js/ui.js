@@ -126,6 +126,7 @@ export class UI {
       mpSettings: $('mp-settings'),
       mpSettingsLock: $('mp-settings-lock'),
       mpMistakeOptions: $('mp-mistake-options'),
+      mpOpponentMistakeOptions: $('mp-opponent-mistake-options'),
       mpSettingsSummary: $('mp-settings-summary'),
       mpSettingsWarning: $('mp-settings-warning'),
       settings: {
@@ -861,9 +862,15 @@ export class UI {
    * Renders the pre-game match settings: one selectable mistake limit per
    * player plus a clear mismatch warning. Disabled once the server locks the
    * settings (the race has started).
+   *
+   * Each player sees two radiogroups: their own (interactive) and their
+   * opponent's (read-only display). The local player's clicks send
+   * MP.PLAYER_SETTINGS; the opponent's group is updated from the server-
+   * broadcast room state so both clients stay in sync.
    */
   renderLobbySettings() {
-    const { mpMistakeOptions, mpSettingsSummary, mpSettingsWarning, mpSettingsLock } = this.elements;
+    const { mpMistakeOptions, mpOpponentMistakeOptions, mpSettingsSummary, mpSettingsWarning, mpSettingsLock } =
+      this.elements;
     const room = this.room;
     if (!mpMistakeOptions || !room) return;
     const players = room.players || [];
@@ -873,6 +880,8 @@ export class UI {
     if (mpSettingsLock) mpSettingsLock.hidden = !locked;
 
     const mine = me?.preferredMaxMistakes;
+
+    // My selector — interactive (unless the race has started or I'm away).
     mpMistakeOptions.replaceChildren();
     for (const option of MISTAKE_LIMIT_OPTIONS) {
       const button = document.createElement('button');
@@ -885,6 +894,31 @@ export class UI {
       button.textContent = mistakeLimitLabel(option);
       button.disabled = locked || !me?.connected;
       mpMistakeOptions.appendChild(button);
+    }
+
+    // Opponent's selector — read-only display, mirrored from server state.
+    // Only the opponent's client sends MP.PLAYER_SETTINGS for their own value,
+    // so this side never wires data-action; it re-renders on every ROOM_STATE.
+    mpOpponentMistakeOptions.replaceChildren();
+    const opponent = others[0] || null;
+    const theirs = opponent?.preferredMaxMistakes;
+    for (const option of MISTAKE_LIMIT_OPTIONS) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'mistake-option';
+      button.dataset.value = String(option);
+      button.setAttribute('role', 'radio');
+      button.setAttribute('aria-checked', option === theirs ? 'true' : 'false');
+      button.textContent = mistakeLimitLabel(option);
+      button.disabled = true;
+      mpOpponentMistakeOptions.appendChild(button);
+    }
+    // Hide the opponent block until a second player has joined.
+    const opponentBlock = mpOpponentMistakeOptions?.closest('#mp-settings');
+    if (opponentBlock) {
+      const label = opponentBlock.querySelector('.lobby-settings-label.muted');
+      if (label) label.hidden = !opponent;
+      mpOpponentMistakeOptions.hidden = !opponent;
     }
 
     const agreed = room.maxMistakes;
@@ -902,8 +936,8 @@ export class UI {
     if (mpSettingsWarning) {
       const mismatch = others.length > 0 && others.some((player) => player.preferredMaxMistakes !== mine);
       if (mismatch && !locked) {
-        const theirs = others.map((player) => `${player.name} picked ${mistakeLimitLabel(player.preferredMaxMistakes)}`).join(', ');
-        mpSettingsWarning.textContent = `Settings mismatch — you picked ${mistakeLimitLabel(mine)}; ${theirs}. Both players must pick the same limit.`;
+        const picked = others.map((player) => `${player.name} picked ${mistakeLimitLabel(player.preferredMaxMistakes)}`).join(', ');
+        mpSettingsWarning.textContent = `Settings mismatch — you picked ${mistakeLimitLabel(mine)}; ${picked}. Both players must pick the same limit.`;
         mpSettingsWarning.hidden = false;
       } else {
         mpSettingsWarning.hidden = true;
