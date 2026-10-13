@@ -9,7 +9,7 @@
  *  - API/sync requests are never cached: the app keeps its own durable queue.
  */
 
-const VERSION = 'sudoku-shell-v1';
+const VERSION = 'sudoku-shell-v2';
 const SHELL_CACHE = `${VERSION}-shell`;
 const RUNTIME_CACHE = `${VERSION}-runtime`;
 
@@ -26,6 +26,9 @@ const SHELL_ASSETS = [
   './js/sync.js',
   './js/multiplayer.js',
   './js/ui.js',
+  './js/chat.js',
+  './js/chat-ui.js',
+  './js/chat-toast.js',
   './assets/icon.svg',
   './assets/icon-192.png',
   './assets/icon-512.png',

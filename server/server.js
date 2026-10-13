@@ -46,6 +46,10 @@ const MAX_MESSAGES_PER_WINDOW = 120;
 const RATE_WINDOW_MS = 1000;
 const MAX_CHAT_LENGTH = 250;
 const MAX_CHAT_PER_SECOND = 5;
+// Pre-game settings: 0 means "unlimited mistakes" (no elimination). The
+// default matches the historical 3-mistake rule so a room that never opens
+// the lobby settings behaves exactly as before.
+const MISTAKE_LIMIT_OPTIONS = [1, 2, 3, 5, 0];
 const CHAT_RATE_WINDOW_MS = 1000;
 const MAX_CHAT_HISTORY = 200;
 const MAX_SYNC_RECORDS = 5000;
@@ -172,6 +176,7 @@ function serializeRoom(room) {
       elapsedMs: player.elapsedMs,
       disconnectedAt: player.disconnectedAt,
       reconnectDeadline: player.reconnectDeadline,
+      preferredMaxMistakes: player.preferredMaxMistakes,
       mistakes: player.mistakes,
       maxMistakes: player.maxMistakes,
       eliminated: player.eliminated,
@@ -256,6 +261,10 @@ async function loadRooms() {
           ...storedPlayer,
           // Mistake state is part of the authoritative race; older snapshots
           // that predate it simply start everyone clean.
+          preferredMaxMistakes:
+            Number.isInteger(storedPlayer.preferredMaxMistakes) && MISTAKE_LIMIT_OPTIONS.includes(storedPlayer.preferredMaxMistakes)
+              ? storedPlayer.preferredMaxMistakes
+              : MAX_MISTAKES,
           mistakes: Number(storedPlayer.mistakes) || 0,
           maxMistakes: Number(storedPlayer.maxMistakes) || MAX_MISTAKES,
           eliminated: Boolean(storedPlayer.eliminated),
@@ -319,6 +328,7 @@ function createRoom(playerId, name, difficulty) {
     abandonedPlayerId: null,
     eliminatedPlayerId: null,
     results: null,
+    maxMistakes: MAX_MISTAKES,
     chatHistory: [],
     players: new Map(),
   };
@@ -339,6 +349,9 @@ function addPlayer(room, { id, name, socket }) {
     disconnectedAt: null,
     reconnectDeadline: null,
     disconnectTimer: null,
+    // Pre-game lobby: each player's preferred mistake limit. Both must pick
+    // the same value before the server will start the race.
+    preferredMaxMistakes: MAX_MISTAKES,
     // Server-owned mistake state — never taken from the client.
     mistakes: 0,
     maxMistakes: MAX_MISTAKES,
@@ -366,6 +379,11 @@ function roomSnapshot(room) {
     seed: room.seed,
     startedAt: room.startedAt,
     winnerId: room.winnerId,
+    // The agreed pre-game settings. `maxMistakes` is null until both players
+    // pick the same limit; `settingsLocked` freezes them while a race runs but
+    // reopens for a rematch.
+    maxMistakes: room.status === 'playing' ? room.maxMistakes ?? MAX_MISTAKES : agreedMistakeLimit(room),
+    settingsLocked: room.status === 'playing',
     players: Array.from(room.players.values()).map((player) => ({
       id: player.id,
       name: player.name,
@@ -375,6 +393,7 @@ function roomSnapshot(room) {
       elapsedMs: player.elapsedMs,
       disconnectedAt: player.disconnectedAt,
       reconnectDeadline: player.reconnectDeadline,
+      preferredMaxMistakes: player.preferredMaxMistakes,
       mistakes: player.mistakes,
       maxMistakes: player.maxMistakes,
       eliminated: player.eliminated,
@@ -413,6 +432,7 @@ function gameSnapshot(room) {
     difficulty: room.difficulty,
     startedAt: room.startedAt,
     status: room.status,
+    maxMistakes: Number.isFinite(room.maxMistakes) ? room.maxMistakes : MAX_MISTAKES,
   };
 }
 
@@ -453,12 +473,28 @@ function resetForRematch(room) {
   }
 }
 
+/**
+ * The pre-game agreement. Returns the shared mistake limit when both players
+ * have picked the same option, or null while they still disagree (or before a
+ * second player has joined). 0 means "unlimited".
+ */
+function agreedMistakeLimit(room) {
+  const players = Array.from(room.players.values());
+  if (players.length < MAX_ROOM_PLAYERS) return null;
+  const first = players[0].preferredMaxMistakes;
+  return players.every((player) => player.preferredMaxMistakes === first) ? first : null;
+}
+
 function startGame(room) {
   if (room.status === 'playing') return;
   if (room.players.size < MAX_ROOM_PLAYERS) return false;
   const connectedPlayers = Array.from(room.players.values()).filter((player) => player.connected);
   if (connectedPlayers.length < MAX_ROOM_PLAYERS) return false;
   if (!Array.from(room.players.values()).every((player) => player.ready)) return false;
+  // Both players must agree on the mistake limit before the server validates a start.
+  const agreed = agreedMistakeLimit(room);
+  if (agreed === null) return false;
+  room.maxMistakes = agreed;
 
   // Fresh puzzle for every race so a rematch is never a memory test.
   const generated = generatePuzzle(room.difficulty);
@@ -481,9 +517,10 @@ function startGame(room) {
     player.completed = false;
     player.completedAt = null;
     player.elapsedMs = null;
-    // Every race starts clean: mistakes never carry across a rematch.
+    // Every race starts clean: mistakes never carry across a rematch, and the
+    // limit both players agreed to in the lobby is applied to each of them.
     player.mistakes = 0;
-    player.maxMistakes = MAX_MISTAKES;
+    player.maxMistakes = agreed;
     player.eliminated = false;
     player.status = PLAYER_STATUS.PLAYING;
     player.progress.clear();
@@ -598,7 +635,7 @@ function handlePlayerMove(room, player, message) {
       value: null,
       correct: false,
       mistakes: player.mistakes,
-      remainingMistakes: Math.max(0, player.maxMistakes - player.mistakes),
+      remainingMistakes: remainingMistakes(player),
       maxMistakes: player.maxMistakes,
       gameStatus: room.status,
     });
@@ -635,7 +672,16 @@ function handlePlayerMove(room, player, message) {
   player.progress.delete(cell);
   schedulePersist();
   send(player.socket, moveResult(room, player, { cell, value, correct: false }));
-  if (player.mistakes >= player.maxMistakes) eliminatePlayer(room, player, opponent);
+  // A limit of 0 means unlimited: mistakes are still counted, but they never
+  // eliminate the player.
+  if (player.maxMistakes > 0 && player.mistakes >= player.maxMistakes) {
+    eliminatePlayer(room, player, opponent);
+  }
+}
+
+/** Lobby-configured mistake budget left for a player; null when unlimited. */
+function remainingMistakes(player) {
+  return player.maxMistakes > 0 ? Math.max(0, player.maxMistakes - player.mistakes) : null;
 }
 
 /** The per-move reply carrying the authoritative mistake state. */
@@ -647,7 +693,7 @@ function moveResult(room, player, { cell, value, correct }) {
     cell,
     value,
     mistakes: player.mistakes,
-    remainingMistakes: Math.max(0, player.maxMistakes - player.mistakes),
+    remainingMistakes: remainingMistakes(player),
     maxMistakes: player.maxMistakes,
     gameStatus: player.eliminated ? 'eliminated' : room.status,
   };
@@ -699,6 +745,9 @@ function finishGame(
     room.results = buildResults(room);
     room.finishReason = reason;
     broadcast(room, { type: MP.GAME_FINISHED, ...roomResultsMessage(room, reason) });
+    // Keep the clients' lobby snapshot honest: it must read `finished` so a
+    // rematch can reopen readiness and settings.
+    broadcastRoomState(room);
     if (resultReason === RESULT_REASONS.OPPONENT_ABANDONED) broadcastGameEnded(room);
     schedulePersist();
     return;
@@ -709,6 +758,7 @@ function finishGame(
   room.results = buildResults(room);
   for (const player of room.players.values()) clearDisconnectTimer(player);
   broadcast(room, { type: MP.GAME_FINISHED, ...roomResultsMessage(room, reason) });
+  broadcastRoomState(room);
   if (resultReason === RESULT_REASONS.OPPONENT_ABANDONED || resultReason === RESULT_REASONS.PLAYER_ABANDONED) {
     broadcastGameEnded(room);
   }
@@ -743,7 +793,7 @@ function roomResultsMessage(room, reason) {
     resultReason: room.resultReason || RESULT_REASONS.PUZZLE_COMPLETED,
     abandonedPlayerId: room.abandonedPlayerId ?? null,
     eliminatedPlayerId: room.eliminatedPlayerId ?? null,
-    maxMistakes: MAX_MISTAKES,
+    maxMistakes: Number.isFinite(room.maxMistakes) ? room.maxMistakes : MAX_MISTAKES,
     results: room.results,
   };
 }
@@ -1230,6 +1280,35 @@ function handleClientMessage(socket, message) {
       break;
     }
 
+    case MP.PLAYER_SETTINGS: {
+      // Pre-game only: the limit is locked the moment the race starts so one
+      // player can never change the rules mid-match.
+      const room = rooms.get(String(message.roomId || '').toUpperCase());
+      const player = room?.players.get(playerId);
+      if (!room || !player) {
+        send(socket, { type: MP.ERROR, code: 'NOT_IN_ROOM', message: 'Not in that room' });
+        return;
+      }
+      if (room.status !== 'lobby') {
+        send(socket, { type: MP.ERROR, code: 'SETTINGS_LOCKED', message: 'Settings are locked once the match starts' });
+        return;
+      }
+      const value = Number(message.maxMistakes);
+      if (!MISTAKE_LIMIT_OPTIONS.includes(value)) {
+        send(socket, { type: MP.ERROR, code: 'INVALID_SETTINGS', message: 'Unsupported mistake limit' });
+        return;
+      }
+      player.preferredMaxMistakes = value;
+      // Changing a setting invalidates that player's readiness so both sides
+      // must agree again before the server will start.
+      player.ready = false;
+      player.socket = socket;
+      room.lastActivity = now();
+      schedulePersist();
+      broadcastRoomState(room);
+      break;
+    }
+
     case MP.START_GAME: {
       const room = rooms.get(String(message.roomId || '').toUpperCase());
       if (!room || !room.players.has(playerId)) {
@@ -1242,7 +1321,15 @@ function handleClientMessage(socket, message) {
         broadcastRoomState(room);
       }
       if (!startGame(room)) {
-        send(socket, { type: MP.ERROR, code: 'NOT_READY', message: 'Both players must be ready' });
+        const agreed = agreedMistakeLimit(room);
+        send(socket, {
+          type: MP.ERROR,
+          code: agreed === null ? 'SETTINGS_MISMATCH' : 'NOT_READY',
+          message:
+            agreed === null
+              ? 'Both players must agree on the mistake limit'
+              : 'Both players must be connected and ready',
+        });
       }
       break;
     }

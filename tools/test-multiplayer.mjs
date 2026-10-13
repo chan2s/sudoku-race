@@ -521,6 +521,148 @@ try {
     b.close();
   });
 
+  /* --------------------------- pre-game lobby --------------------------- */
+
+  console.log('\nPRE-GAME LOBBY');
+
+  await test('mismatched mistake limits block the start until both players agree', async () => {
+    const a = makeClient('lobby-a', 'LobbyA');
+    const b = makeClient('lobby-b', 'LobbyB');
+    await a.connect();
+    await b.connect();
+    a.send({ type: MP.CREATE_ROOM, name: 'LobbyA', difficulty: 'easy' });
+    const created = await a.waitFor(MP.ROOM_CREATED);
+    const code = created.room.code;
+    b.send({ type: MP.JOIN_ROOM, roomId: code, name: 'LobbyB' });
+    await b.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.length === 2 });
+    a.clear();
+    b.clear();
+
+    a.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 5 });
+    b.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 1 });
+    const mismatch = await a.waitFor(MP.ROOM_STATE, {
+      predicate: (message) => {
+        const mine = message.room.players.find((player) => player.id === 'lobby-a')?.preferredMaxMistakes;
+        const theirs = message.room.players.find((player) => player.id === 'lobby-b')?.preferredMaxMistakes;
+        return mine === 5 && theirs === 1;
+      },
+    });
+    assert.equal(mismatch.room.maxMistakes, null, 'no agreed limit while the players disagree');
+    assert.equal(mismatch.room.settingsLocked, false);
+
+    // Both ready with different limits must NOT start the race.
+    a.send({ type: MP.PLAYER_READY, roomId: code, ready: true });
+    b.send({ type: MP.PLAYER_READY, roomId: code, ready: true });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(
+      a.messages.filter((message) => message.type === MP.GAME_STARTED).length,
+      0,
+      'a mismatch must never start the race',
+    );
+
+    // B agrees with A: the change resets B's readiness, then the race starts.
+    b.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 5 });
+    const reset = await b.waitFor(MP.ROOM_STATE, {
+      predicate: (message) => message.room.maxMistakes === 5,
+    });
+    assert.equal(reset.room.players.find((player) => player.id === 'lobby-b').ready, false, 'changing a setting clears readiness');
+    b.send({ type: MP.PLAYER_READY, roomId: code, ready: true });
+    const started = await a.waitFor(MP.GAME_STARTED);
+    await b.waitFor(MP.GAME_STARTED);
+    assert.equal(started.maxMistakes, 5, 'both players receive the agreed limit');
+    a.close();
+    b.close();
+  });
+
+  await test('unlimited mistakes never eliminate a player and are shared by both sides', async () => {
+    const a = makeClient('unlim-a', 'UnlimA');
+    const b = makeClient('unlim-b', 'UnlimB');
+    await a.connect();
+    await b.connect();
+    a.send({ type: MP.CREATE_ROOM, name: 'UnlimA', difficulty: 'easy' });
+    const created = await a.waitFor(MP.ROOM_CREATED);
+    const code = created.room.code;
+    b.send({ type: MP.JOIN_ROOM, roomId: code, name: 'UnlimB' });
+    await b.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.length === 2 });
+    a.clear();
+    b.clear();
+    a.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 0 });
+    b.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 0 });
+    await a.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.maxMistakes === 0 });
+    a.send({ type: MP.PLAYER_READY, roomId: code, ready: true });
+    b.send({ type: MP.PLAYER_READY, roomId: code, ready: true });
+    const started = await a.waitFor(MP.GAME_STARTED);
+    await b.waitFor(MP.GAME_STARTED);
+    assert.equal(started.maxMistakes, 0, 'unlimited travels as 0');
+
+    const derived = generatePuzzle(started.difficulty, started.seed);
+    const empties = derived.puzzle.map((value, index) => (value === 0 ? index : -1)).filter((index) => index >= 0);
+    for (let i = 0; i < 4; i++) {
+      const cell = empties[i];
+      a.clear();
+      a.send({ type: MP.PLAYER_MOVE, roomId: code, cell, value: wrongValue(derived.solution, cell) });
+      const result = await a.waitFor(MP.MOVE_RESULT, { predicate: (message) => message.cell === cell });
+      assert.equal(result.correct, false);
+      assert.equal(result.mistakes, i + 1, 'mistakes are still counted');
+      assert.equal(result.remainingMistakes, null, 'unlimited has no remaining count');
+      assert.equal(result.maxMistakes, 0);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(
+      a.messages.filter((message) => message.type === MP.GAME_FINISHED).length,
+      0,
+      'unlimited mistakes never end the race',
+    );
+    a.close();
+    b.close();
+  });
+
+  await test('changing a setting clears the changer\'s readiness', async () => {
+    const a = makeClient('reset-a', 'ResetA');
+    const b = makeClient('reset-b', 'ResetB');
+    await a.connect();
+    await b.connect();
+    a.send({ type: MP.CREATE_ROOM, name: 'ResetA', difficulty: 'easy' });
+    const created = await a.waitFor(MP.ROOM_CREATED);
+    const code = created.room.code;
+    b.send({ type: MP.JOIN_ROOM, roomId: code, name: 'ResetB' });
+    await b.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.length === 2 });
+    a.clear();
+    b.clear();
+    a.send({ type: MP.PLAYER_READY, roomId: code, ready: true });
+    await a.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.find((player) => player.id === 'reset-a')?.ready === true });
+    a.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 5 });
+    const after = await a.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.find((player) => player.id === 'reset-a')?.preferredMaxMistakes === 5 });
+    assert.equal(after.room.players.find((player) => player.id === 'reset-a').ready, false, 'readiness resets when a setting changes');
+    a.close();
+    b.close();
+  });
+
+  await test('settings are rejected once the race has started, and unsupported options are refused', async () => {
+    const { a, b, code } = await startRacePair('lock-a', 'lock-b');
+    a.clear();
+    a.send({ type: MP.PLAYER_SETTINGS, roomId: code, maxMistakes: 1 });
+    const locked = await a.waitFor(MP.ERROR, { predicate: (message) => message.code === 'SETTINGS_LOCKED' });
+    assert.equal(locked.code, 'SETTINGS_LOCKED', 'the limit is locked for the whole match');
+    a.close();
+    b.close();
+
+    const c = makeClient('bad-a', 'BadA');
+    const d = makeClient('bad-b', 'BadB');
+    await c.connect();
+    await d.connect();
+    c.send({ type: MP.CREATE_ROOM, name: 'BadA', difficulty: 'easy' });
+    const created = await c.waitFor(MP.ROOM_CREATED);
+    d.send({ type: MP.JOIN_ROOM, roomId: created.room.code, name: 'BadB' });
+    await d.waitFor(MP.ROOM_STATE, { predicate: (message) => message.room.players.length === 2 });
+    c.clear();
+    c.send({ type: MP.PLAYER_SETTINGS, roomId: created.room.code, maxMistakes: 4 });
+    const invalid = await c.waitFor(MP.ERROR, { predicate: (message) => message.code === 'INVALID_SETTINGS' });
+    assert.equal(invalid.code, 'INVALID_SETTINGS');
+    c.close();
+    d.close();
+  });
+
   /* --------------------------- disconnections --------------------------- */
 
   console.log('\nDISCONNECTION HANDLING');

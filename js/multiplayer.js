@@ -14,6 +14,7 @@ export const MP = {
   // client → server
   CREATE_ROOM: 'CREATE_ROOM',
   JOIN_ROOM: 'JOIN_ROOM',
+  PLAYER_SETTINGS: 'PLAYER_SETTINGS',
   PLAYER_READY: 'PLAYER_READY',
   START_GAME: 'START_GAME',
   PLAYER_PROGRESS: 'PLAYER_PROGRESS',
@@ -52,6 +53,26 @@ export const MP = {
  */
 export const MAX_MISTAKES = 3;
 
+/**
+ * Pre-game mistake limits both players pick from. `0` means "unlimited": wrong
+ * entries are still flagged, they just never end the match. The first option is
+ * the default so a room that never touches the lobby behaves as it always did.
+ */
+export const MISTAKE_LIMIT_OPTIONS = [1, 2, 3, 5, 0];
+export const DEFAULT_MISTAKE_LIMIT = MAX_MISTAKES;
+
+/** Turns a wire value (0 = unlimited) into the engine's numeric limit. */
+export function normalizeMistakeLimit(value) {
+  const limit = Number(value);
+  return Number.isFinite(limit) && limit > 0 ? limit : Infinity;
+}
+
+/** Human label for a mistake-limit option (0 = unlimited). */
+export function mistakeLimitLabel(value) {
+  const limit = Number(value);
+  return !Number.isFinite(limit) || limit <= 0 ? 'Unlimited' : String(limit);
+}
+
 /** Explicit result reasons the server stores with every finished race. */
 export const RESULT_REASON = {
   PLAYER_COMPLETED: 'PLAYER_COMPLETED',
@@ -76,6 +97,10 @@ export const MP_ERRORS = {
   INVALID_SOLUTION: 'INVALID_SOLUTION',
   NOT_IN_ROOM: 'NOT_IN_ROOM',
   SERVER_UNAVAILABLE: 'SERVER_UNAVAILABLE',
+  NOT_READY: 'NOT_READY',
+  SETTINGS_MISMATCH: 'SETTINGS_MISMATCH',
+  SETTINGS_LOCKED: 'SETTINGS_LOCKED',
+  INVALID_SETTINGS: 'INVALID_SETTINGS',
 };
 
 const SESSION_KEY = 'sudoku:mp-session';
@@ -363,6 +388,12 @@ export class MultiplayerClient extends Emitter {
     return this.send({ type: MP.PLAYER_READY, roomId: this.roomId(), ready: Boolean(ready) });
   }
 
+  /** Pre-game lobby: proposes a mistake limit. The server validates and locks it. */
+  setPreferredMistakes(maxMistakes) {
+    if (!this.room) return false;
+    return this.send({ type: MP.PLAYER_SETTINGS, roomId: this.roomId(), maxMistakes: Number(maxMistakes) });
+  }
+
   startGame() {
     return this.send({ type: MP.START_GAME, roomId: this.roomId() });
   }
@@ -537,6 +568,9 @@ export class MultiplayerClient extends Emitter {
       difficulty: game.difficulty,
       startedAt: game.startedAt,
       status: game.status || 'playing',
+      // The agreed pre-game mistake limit (0 = unlimited) travels with the
+      // start message so both clients initialise the same rule set.
+      maxMistakes: Number.isFinite(Number(game.maxMistakes)) ? Number(game.maxMistakes) : MAX_MISTAKES,
     };
     this.emit('game-started', this.game);
   }

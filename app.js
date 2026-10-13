@@ -13,12 +13,13 @@ import {
   MultiplayerClient,
   CONNECTION_STATE,
   MP_ERRORS,
-  MAX_MISTAKES,
+  normalizeMistakeLimit,
   defaultMultiplayerUrl,
   readStoredSession,
 } from './js/multiplayer.js';
 import { ChatClient } from './js/chat.js';
 import { ChatUI } from './js/chat-ui.js';
+import { ChatToast } from './js/chat-toast.js';
 import { UI } from './js/ui.js';
 import { formatTime } from './js/timer.js';
 
@@ -32,6 +33,10 @@ const MP_ERROR_MESSAGES = {
   [MP_ERRORS.INVALID_SOLUTION]: 'The server rejected your finished board — it did not match the shared puzzle.',
   [MP_ERRORS.NOT_IN_ROOM]: 'You are no longer part of that room.',
   [MP_ERRORS.SERVER_UNAVAILABLE]: 'The multiplayer server is unavailable. Single player still works offline.',
+  [MP_ERRORS.NOT_READY]: 'Both players must be connected and ready.',
+  [MP_ERRORS.SETTINGS_MISMATCH]: 'Both players must agree on the same mistake limit.',
+  [MP_ERRORS.SETTINGS_LOCKED]: 'Match settings are locked once the race starts.',
+  [MP_ERRORS.INVALID_SETTINGS]: 'That mistake limit is not supported.',
 };
 
 class SudokuApp {
@@ -42,6 +47,7 @@ class SudokuApp {
     this.client = null;
     this.chat = null;
     this.chatUI = null;
+    this.chatToast = null;
     this.engine = null;
     this.settings = { ...DEFAULT_SETTINGS, playerName: '' };
     this.stats = defaultStats();
@@ -65,6 +71,7 @@ class SudokuApp {
       onCreateRoom: (difficulty, name) => this.createRoom(difficulty, name),
       onJoinRoom: (code, name) => this.joinRoom(code, name),
       onToggleReady: () => this.toggleReady(),
+      onSetMistakes: (value) => this.setMistakesPreference(value),
       onStartGame: () => this.startRace(),
       onLeaveRoom: () => this.leaveRoom(),
       onOpenChat: () => this.openMultiplayerChat(),
@@ -735,6 +742,14 @@ class SudokuApp {
       this.chat.attach();
       this.chatUI.setChat(this.chat);
       this.chat.syncFromClient();
+
+      // Incoming-message notifications live in a dedicated, space-reserved
+      // strip above the board — never over it.
+      this.chatToast = new ChatToast({
+        container: this.ui.elements.chatToasts,
+        onOpen: () => this.openMultiplayerChat(),
+      });
+      this.chat.on('message', (message) => this.onIncomingChatMessage(message, client));
     }
 
     return client;
@@ -800,6 +815,31 @@ class SudokuApp {
     client.setReady(!me?.ready);
   }
 
+  /** Pre-game lobby: propose a mistake limit; the server validates and locks it. */
+  setMistakesPreference(value) {
+    const client = this.client;
+    if (!client?.room) return;
+    if (client.room.settingsLocked) {
+      this.ui.showToast('Match settings are locked once the race starts');
+      return;
+    }
+    client.setPreferredMistakes(value);
+  }
+
+  /**
+   * Shows a toast for a live opponent message. Historical messages replayed on
+   * join/reconnect travel through `chat-history`, never here, so a reconnect
+   * never floods the player with stale notifications. Messages the user sent
+   * and messages arriving while the chat is already open are ignored.
+   */
+  onIncomingChatMessage(message, client) {
+    if (!this.chatToast || !message || message.type !== 'chat') return;
+    if (message.playerId && message.playerId === client.playerId) return;
+    if (this.chat?.isVisible()) return;
+    if (this.screen !== 'game') return;
+    this.chatToast.show({ name: message.playerName, text: message.message });
+  }
+
   startRace() {
     this.client?.startGame();
   }
@@ -818,6 +858,8 @@ class SudokuApp {
   teardownMultiplayer() {
     this.chatUI?.detachChat();
     this.chat?.detach();
+    this.chatToast?.dismiss();
+    this.chatToast = null;
     this.chatUI = null;
     this.chat = null;
     this.client?.leaveRoom();
@@ -850,7 +892,8 @@ class SudokuApp {
           difficulty: game.difficulty,
           seed: game.seed,
           mode: 'multiplayer',
-          mistakeLimit: MAX_MISTAKES, // server-authoritative: 3 and you are out
+          // The limit both players agreed to in the lobby (0 = unlimited).
+          mistakeLimit: normalizeMistakeLimit(game.maxMistakes),
           roomId: game.roomId,
           roomCode: this.client?.room?.code,
           playerId: this.client?.playerId,
@@ -866,7 +909,7 @@ class SudokuApp {
     // The server owns the mistake state; adopt it (covers a fresh race — all
     // zeroes — and a rejoin after a disconnect, which must not reset mistakes).
     const serverPlayer = this.client?.me?.() || null;
-    engine.mistakeLimit = Number(serverPlayer?.maxMistakes) > 0 ? Number(serverPlayer.maxMistakes) : MAX_MISTAKES;
+    engine.mistakeLimit = normalizeMistakeLimit(game.maxMistakes);
     engine.mistakes = Number(serverPlayer?.mistakes) || 0;
     engine.eliminated = Boolean(serverPlayer?.eliminated);
 

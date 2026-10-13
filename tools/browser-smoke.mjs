@@ -747,6 +747,33 @@ try {
     assert.ok(list.some((entry) => entry.includes('Alex')));
   });
 
+  await test('the lobby requires matching mistake limits and gates the start', async () => {
+    // Tab A picks 5, tab B picks 1: a clear mismatch with a disabled Start.
+    await page.evaluate(`document.querySelector('#mp-mistake-options [data-value="5"]').click()`);
+    await pageB.evaluate(`document.querySelector('#mp-mistake-options [data-value="1"]').click()`);
+    await waitFor(() => page.evaluate(`!document.querySelector('#mp-settings-warning').hidden`), {
+      label: 'mismatch warning',
+    });
+    const mismatch = await page.evaluate(`(() => ({
+      warning: document.querySelector('#mp-settings-warning').textContent,
+      startDisabled: document.querySelector('#mp-start').disabled,
+      startVisible: !document.querySelector('#mp-start').hidden,
+    }))()`);
+    assert.equal(mismatch.startVisible, true, 'the Start Match action is always presented');
+    assert.equal(mismatch.startDisabled, true, 'Start stays disabled while the settings disagree');
+    assert.match(mismatch.warning, /mismatch/i);
+
+    // Return both players to the default limit so the race below is unchanged.
+    await pageB.evaluate(`document.querySelector('#mp-mistake-options [data-value="3"]').click()`);
+    await page.evaluate(`document.querySelector('#mp-mistake-options [data-value="3"]').click()`);
+    await waitFor(
+      () => page.evaluate(`document.querySelector('#mp-settings-warning').hidden && document.querySelector('#mp-settings-summary').textContent.includes('3')`),
+      { label: 'settings agreed' },
+    );
+    const agreed = await pageB.evaluate(`document.querySelector('#mp-mistake-options [data-value="3"]').getAttribute('aria-checked')`);
+    assert.equal(agreed, 'true', 'the agreed limit is reflected in both lobbies');
+  });
+
   await test('both players ready starts the race with the same puzzle', async () => {
     await page.click('[data-action="toggle-ready"]');
     await pageB.click('[data-action="toggle-ready"]');
@@ -783,6 +810,129 @@ try {
     assert.match(hud.opponentStatus, /Solving|Finished/);
     assert.equal(hud.you, 'YOU');
     await page.screenshot('03-multiplayer-race');
+  });
+
+  await test('desktop chat sits beside the board without pushing it down', async () => {
+    const layout = await page.evaluate(`(() => {
+      const panel = document.querySelector('#chat-panel');
+      const board = document.querySelector('#board');
+      if (!panel || panel.hidden || !board) return null;
+      const p = panel.getBoundingClientRect();
+      const b = board.getBoundingClientRect();
+      const input = document.querySelector('#chat-input').getBoundingClientRect();
+      const send = document.querySelector('#chat-send').getBoundingClientRect();
+      return {
+        panelLeft: p.left, panelWidth: p.width,
+        boardRight: b.right, boardTop: b.top,
+        inputVisible: input.height > 0,
+        sendVisible: send.height > 0,
+        scrollWidth: document.documentElement.scrollWidth,
+        innerWidth: window.innerWidth,
+      };
+    })()`);
+    assert.ok(layout, 'the desktop chat panel is visible during a race');
+    assert.ok(layout.panelWidth >= 240 && layout.panelWidth <= 360, `chat panel width ${layout.panelWidth}`);
+    assert.ok(
+      layout.panelLeft >= layout.boardRight - 4,
+      `chat must sit beside the board (panel left ${layout.panelLeft}, board right ${layout.boardRight})`,
+    );
+    assert.equal(layout.inputVisible, true, 'the message input stays visible at the bottom of the panel');
+    assert.equal(layout.sendVisible, true, 'the send button stays visible');
+    assert.ok(layout.scrollWidth <= layout.innerWidth + 1, 'the chat panel does not cause horizontal overflow');
+  });
+
+  await test('an incoming message raises a toast above the board and never self-notifies', async () => {
+    // A phone-sized receiver hides the desktop panel, so the toast path is used.
+    await pageB.setMobile(390, 844);
+    await sleep(250);
+    const message = 'Meet you at the finish line';
+    const afterSend = await page.evaluate(`(() => {
+      const input = document.querySelector('#chat-input');
+      input.focus();
+      input.value = ${JSON.stringify(message)};
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      return input.value;
+    })()`);
+    assert.equal(afterSend, '', 'pressing Enter clears the input after a successful send');
+
+    await waitFor(() => pageB.evaluate(`!!document.querySelector('#chat-toasts .chat-toast')`), {
+      timeout: 8000,
+      label: 'toast on the receiving tab',
+    });
+    const toast = await pageB.evaluate(`(() => {
+      const el = document.querySelector('#chat-toasts .chat-toast');
+      const board = document.querySelector('#board').getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      return {
+        name: el.querySelector('.chat-toast-name').textContent,
+        text: el.querySelector('.chat-toast-text').textContent,
+        top: r.top, bottom: r.bottom, left: r.left, right: r.right,
+        boardTop: board.top, boardBottom: board.bottom,
+        innerWidth: window.innerWidth,
+      };
+    })()`);
+    assert.match(toast.name, /Cristian/, 'the toast names the sender');
+    assert.match(toast.text, /finish line/, 'the toast previews the message');
+    assert.ok(
+      toast.bottom <= toast.boardTop + 1,
+      `the toast must sit above the board (toast bottom ${toast.bottom}, board top ${toast.boardTop})`,
+    );
+    assert.ok(toast.left >= 0 && toast.right <= toast.innerWidth + 1, 'the toast stays inside the viewport');
+
+    const own = await page.evaluate(`document.querySelectorAll('#chat-toasts .chat-toast').length`);
+    assert.equal(own, 0, 'the sender is never notified of their own message');
+
+    const rendered = await pageB.evaluate(
+      `Array.from(document.querySelectorAll('#chat-mobile-messages .chat-msg-text, #chat-messages .chat-msg-text')).some((n) => n.textContent.includes('finish line'))`,
+    );
+    assert.equal(rendered, true, 'the incoming message renders live without a refresh');
+
+    await waitFor(() => pageB.evaluate(`!document.querySelector('#chat-toasts .chat-toast')`), {
+      timeout: 7000,
+      label: 'toast auto-dismiss',
+    });
+    const settled = await pageB.evaluate(`(() => {
+      const board = document.querySelector('#board').getBoundingClientRect();
+      return { boardTop: board.top, boardWidth: board.width };
+    })()`);
+    assert.ok(settled.boardTop > 0 && settled.boardWidth > 0, 'the board stays laid out after the toast disappears');
+  });
+
+  await test('mobile chat opens as a bottom sheet, sends, and closing it keeps the race alive', async () => {
+    assert.equal(await pageB.evaluate(`document.querySelector('#chat-btn').hidden`), false, 'the mobile chat button is available during a race');
+    await pageB.click('#chat-btn');
+    await waitFor(() => pageB.evaluate(`!document.querySelector('#chat-mobile-panel').hidden`), { label: 'mobile chat open' });
+    const sheet = await pageB.evaluate(`(() => {
+      const panel = document.querySelector('#chat-mobile-panel');
+      const input = document.querySelector('#chat-mobile-input').getBoundingClientRect();
+      const pr = panel.getBoundingClientRect();
+      return {
+        heading: panel.querySelector('.chat-mobile-title').textContent,
+        hasClose: !!panel.querySelector('#chat-mobile-close'),
+        inputHeight: input.height,
+        inputBottom: input.bottom,
+        panelBottom: pr.bottom,
+        innerHeight: window.innerHeight,
+      };
+    })()`);
+    assert.equal(sheet.heading, 'Chat', 'the sheet has a visible heading');
+    assert.equal(sheet.hasClose, true, 'the sheet has a close button');
+    assert.ok(sheet.inputHeight > 0, 'the message input is visible');
+    assert.ok(sheet.inputBottom <= sheet.innerHeight + 1, 'the input stays inside the viewport above the safe area');
+
+    await pageB.evaluate(
+      `(() => { const i = document.querySelector('#chat-mobile-input'); i.focus(); i.value = 'On my way'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`,
+    );
+    await waitFor(
+      () => page.evaluate(`Array.from(document.querySelectorAll('#chat-messages .chat-msg-text')).some((n) => n.textContent.includes('On my way'))`),
+      { label: 'desktop tab receives the mobile message' },
+    );
+    assert.equal(await pageB.evaluate(`document.querySelector('#chat-mobile-input').value`), '', 'the mobile input clears after sending');
+
+    await pageB.click('#chat-mobile-close');
+    await waitFor(() => pageB.evaluate(`document.querySelector('#chat-mobile-panel').hidden`), { label: 'mobile chat closed' });
+    const stillRunning = await pageB.evaluate(`!document.querySelector('#mp-hud').hidden && document.querySelector('#mp-opp-status').textContent.length > 0`);
+    assert.equal(stillRunning, true, 'closing the chat does not disturb the race');
   });
 
   await test('the server declares the first finisher the winner in both tabs', async () => {

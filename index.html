@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Sudoku — Beat the Clock</title>
     <meta
       name="description"
@@ -75,6 +75,10 @@
               <span id="game-timer" class="timer" aria-live="off">00:00</span>
             </div>
           </header>          <p id="mistake-flash" class="mistake-flash" role="status" aria-live="assertive" hidden></p>
+
+          <!-- Incoming-chat notifications: a dedicated strip that reserves its
+               own space above the board so it can never overlap the grid. -->
+          <div id="chat-toasts" class="chat-toasts" role="status" aria-live="polite" aria-atomic="true"></div>
 
           <div id="mp-hud" class="mp-hud" hidden>
             <div class="mp-player" id="mp-you">
@@ -245,6 +249,23 @@
               </button>
             </p>
             <ul id="mp-players" class="players"></ul>
+
+            <div id="mp-settings" class="lobby-settings">
+              <div class="lobby-settings-head">
+                <h3 class="lobby-settings-title">Match settings</h3>
+                <span id="mp-settings-lock" class="lobby-lock" hidden>Locked</span>
+              </div>
+              <p class="lobby-settings-label">Mistake limit</p>
+              <div
+                id="mp-mistake-options"
+                class="mistake-options"
+                role="radiogroup"
+                aria-label="Mistake limit"
+              ></div>
+              <p id="mp-settings-summary" class="lobby-settings-summary"></p>
+              <p id="mp-settings-warning" class="lobby-settings-warning" role="alert" hidden></p>
+            </div>
+
             <p id="mp-room-hint" class="muted small"></p>
             <div class="panel-actions">
               <button class="btn btn-primary" id="mp-ready" type="button" data-action="toggle-ready">

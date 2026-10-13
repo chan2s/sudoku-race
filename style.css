@@ -105,6 +105,11 @@ body {
   }
 }
 
+/* A multiplayer race with the desktop chat gets a wider two-column shell. */
+.screens.screens--wide {
+  max-width: min(1100px, calc(100vw - 32px));
+}
+
 .screen {
   display: flex;
   flex-direction: column;
@@ -483,6 +488,167 @@ select {
 
 .screen-game {
   justify-content: flex-start;
+}
+
+/*
+ * Incoming-chat notifications get their own strip above the board. The strip
+ * only reserves height during a live multiplayer race, and because the toasted
+ * card is the same size as the reserved row the Sudoku grid never shifts when
+ * a notification appears or disappears.
+ */
+.chat-toasts {
+  display: none;
+}
+
+.screen-game.mp-active .chat-toasts {
+  display: flex;
+  align-items: center;
+  min-height: 52px;
+}
+
+.chat-toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  text-align: left;
+}
+
+.chat-toast:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chat-toast-icon {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.chat-toast-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.chat-toast-name {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.chat-toast-text {
+  font-size: 0.85rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-toast-count {
+  flex: 0 0 auto;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 1px 7px;
+}
+
+.chat-toast-dismiss {
+  flex: 0 0 auto;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  min-width: 32px;
+  min-height: 32px;
+}
+
+.chat-toast-dismiss:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+/*
+ * Desktop two-column race layout: the chat panel sits beside the board instead
+ * of stretching the page below it, and only at widths where the panel is shown.
+ */
+@media (min-width: 760px) {
+  .screen-game.mp-active {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(260px, 30vw, 340px);
+    grid-template-areas:
+      "header     chat"
+      "flash      chat"
+      "toasts     chat"
+      "hud        chat"
+      "disconnect chat"
+      "board      chat"
+      "numpad     chat"
+      "controls   chat";
+    align-items: start;
+    column-gap: 18px;
+  }
+
+  .screen-game.mp-active .game-header {
+    grid-area: header;
+  }
+  .screen-game.mp-active #mistake-flash {
+    grid-area: flash;
+  }
+  .screen-game.mp-active .chat-toasts {
+    grid-area: toasts;
+  }
+  .screen-game.mp-active .mp-hud {
+    grid-area: hud;
+  }
+  .screen-game.mp-active .mp-disconnect {
+    grid-area: disconnect;
+  }
+  .screen-game.mp-active .board-wrap {
+    grid-area: board;
+  }
+  .screen-game.mp-active .numpad {
+    grid-area: numpad;
+  }
+  .screen-game.mp-active .controls {
+    grid-area: controls;
+  }
+  .screen-game.mp-active .chat-panel {
+    grid-area: chat;
+    align-self: start;
+    position: sticky;
+    top: 16px;
+    width: auto;
+    max-width: none;
+    height: min(720px, calc(100dvh - 40px));
+    max-height: calc(100dvh - 40px);
+  }
+
+  /* The game column keeps the board's own max-width. */
+  .screen-game.mp-active .board,
+  .screen-game.mp-active .numpad,
+  .screen-game.mp-active .controls,
+  .screen-game.mp-active .mp-hud {
+    max-width: 520px;
+  }
 }
 
 .game-header {
@@ -966,7 +1132,8 @@ select {
   gap: 10px;
   padding: 12px;
   overflow: hidden;
-  min-height: 280px;
+  min-height: 0;
+  height: 100%;
 }
 
 .chat-panel-head {
@@ -997,11 +1164,11 @@ select {
 .chat-messages {
   flex: 1 1 auto;
   overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-height: 140px;
-  max-height: 360px;
+  min-height: 0;
   background: var(--bg-soft);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -1120,9 +1287,13 @@ select {
   border-top: 1px solid var(--line);
   border-radius: 18px 18px 0 0;
   box-shadow: 0 -12px 30px rgba(0, 0, 0, 0.4);
-  max-height: 70vh;
+  /* dvh tracks the mobile browser chrome and the on-screen keyboard
+     (interactive-widget=resizes-content), so the input row stays visible. */
+  height: min(72dvh, 580px);
+  max-height: 78dvh;
   display: flex;
   flex-direction: column;
+  overscroll-behavior: contain;
 }
 
 .chat-mobile-head {
@@ -1149,9 +1320,11 @@ select {
 .chat-mobile-messages {
   flex: 1 1 auto;
   overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-height: 0;
   padding: 10px 12px;
   background: var(--bg-soft);
 }
@@ -1159,7 +1332,7 @@ select {
 .chat-mobile-input-row {
   display: flex;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
   align-items: stretch;
 }
@@ -1190,6 +1363,104 @@ select {
   .chat-panel {
     display: none !important;
   }
+}
+
+/* --------------------------------------------- lobby pre-game settings */
+
+.lobby-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.lobby-settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.lobby-settings-title {
+  margin: 0;
+  font-size: 0.75rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.lobby-lock {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.lobby-settings-label {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.mistake-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mistake-option {
+  appearance: none;
+  flex: 1 1 64px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0.5rem 0.4rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  min-height: 44px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.mistake-option:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.mistake-option[aria-checked='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.mistake-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.lobby-settings-summary {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
+.lobby-settings-warning {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
 }
 
 /* -------------------------------------------------- multiplayer */

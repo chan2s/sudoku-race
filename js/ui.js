@@ -10,7 +10,7 @@
 import { CELLS, DIFFICULTIES, findDuplicateCells, peersOf, rowCol } from './sudoku.js';
 import { formatTime, formatPercent } from './timer.js';
 import { GAME_STATUS } from './game.js';
-import { CONNECTION_STATE } from './multiplayer.js';
+import { CONNECTION_STATE, MISTAKE_LIMIT_OPTIONS, mistakeLimitLabel } from './multiplayer.js';
 import { SYNC_STATUS } from './sync.js';
 
 const DIFFICULTY_LABELS = {
@@ -109,6 +109,13 @@ export class UI {
       chatMobileSend: $('chat-mobile-send'),
       chatMobileClose: $('chat-mobile-close'),
       chatMobileBadge: $('chat-badge'),
+      chatToasts: $('chat-toasts'),
+      // multiplayer lobby (pre-game settings)
+      mpSettings: $('mp-settings'),
+      mpSettingsLock: $('mp-settings-lock'),
+      mpMistakeOptions: $('mp-mistake-options'),
+      mpSettingsSummary: $('mp-settings-summary'),
+      mpSettingsWarning: $('mp-settings-warning'),
       settings: {
         name: $('set-name'),
         mistakes: $('set-mistakes'),
@@ -239,6 +246,9 @@ export class UI {
       case 'toggle-ready':
         this.handlers.onToggleReady?.();
         break;
+      case 'set-mistakes':
+        this.handlers.onSetMistakes?.(Number(element.dataset.value));
+        break;
       case 'start-game':
         this.handlers.onStartGame?.();
         break;
@@ -278,7 +288,7 @@ export class UI {
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
       // Chat surfaces own their keys: a focused send button or anything inside
       // the chat panels must never pause the race or edit a Sudoku cell.
-      if (event.target?.closest?.('#chat-panel, #chat-mobile-panel, #chat-btn')) return;
+      if (event.target?.closest?.('#chat-panel, #chat-mobile-panel, #chat-btn, #chat-toasts')) return;
       if (this.currentScreen !== 'game' || !this.engine) return;
       const key = event.key;
 
@@ -488,17 +498,17 @@ export class UI {
     const el = this.elements.mpYouMistakes;
     if (!el) return;
     const engine = this.engine;
-    const limited = Boolean(engine) && engine.mode === 'multiplayer' && engine.mistakeLimit !== Infinity;
-    if (!limited) {
+    if (!engine || engine.mode !== 'multiplayer') {
       el.hidden = true;
       return;
     }
     const max = engine.mistakeLimit;
-    const count = Math.min(engine.mistakes, max);
+    const unlimited = max === Infinity;
+    const count = unlimited ? engine.mistakes : Math.min(engine.mistakes, max);
     el.hidden = false;
-    el.textContent = `⚠ Mistakes ${count} / ${max}`;
-    el.classList.toggle('is-warning', count > 0 && count < max);
-    el.classList.toggle('is-danger', count >= max);
+    el.textContent = unlimited ? `⚠ Mistakes ${count} / Unlimited` : `⚠ Mistakes ${count} / ${max}`;
+    el.classList.toggle('is-warning', count > 0 && (unlimited || count < max));
+    el.classList.toggle('is-danger', !unlimited && count >= max);
   }
 
   /**
@@ -778,22 +788,93 @@ export class UI {
       }
     }
 
+    this.renderLobbySettings();
+
     const me = (this.room.players || []).find((player) => player.id === this.room.youId);
     const others = (this.room.players || []).filter((player) => player.id !== this.room.youId);
     const readyCount = (this.room.players || []).filter((player) => player.ready).length;
+    const bothPresent = (this.room.players || []).length >= 2;
+    const allConnected = (this.room.players || []).every((player) => player.connected);
+    const settingsValid = this.room.maxMistakes !== null && this.room.maxMistakes !== undefined;
     if (mpReady) {
       mpReady.textContent = me?.ready ? 'Not ready' : 'I’m ready';
-      mpReady.disabled = !me?.connected;
+      // Readiness stays clickable in the lobby and on the result screen, where
+      // it means "rematch"; only a running race disables it.
+      mpReady.disabled = !me?.connected || this.room.status === 'playing';
     }
     if (mpStart) {
-      const canStart = Boolean(me?.ready) && readyCount >= 2 && this.room.status !== 'finished';
-      mpStart.hidden = !canStart;
+      const canStart =
+        settingsValid &&
+        bothPresent &&
+        allConnected &&
+        Boolean(me?.ready) &&
+        readyCount >= 2 &&
+        this.room.status === 'lobby';
+      // The Start Match action is always present but stays disabled until both
+      // players are connected, settings agree and both are ready.
+      mpStart.disabled = !canStart;
+      mpStart.hidden = false;
     }
     if (mpRoomHint) {
-      if (!others.length) mpRoomHint.textContent = 'Share the room code with a friend — the game starts when you are both ready.';
+      if (!others.length) mpRoomHint.textContent = 'Share the room code with a friend — the game starts when you are both ready and agree on the settings.';
       else if (others.every((player) => !player.connected)) mpRoomHint.textContent = 'Opponent reconnecting…';
+      else if (!settingsValid) mpRoomHint.textContent = 'Pick the same mistake limit to continue.';
       else if (readyCount < 2) mpRoomHint.textContent = 'Waiting for both players to be ready.';
       else mpRoomHint.textContent = 'Both players ready — start the race!';
+    }
+  }
+
+  /**
+   * Renders the pre-game match settings: one selectable mistake limit per
+   * player plus a clear mismatch warning. Disabled once the server locks the
+   * settings (the race has started).
+   */
+  renderLobbySettings() {
+    const { mpMistakeOptions, mpSettingsSummary, mpSettingsWarning, mpSettingsLock } = this.elements;
+    const room = this.room;
+    if (!mpMistakeOptions || !room) return;
+    const players = room.players || [];
+    const me = players.find((player) => player.id === room.youId);
+    const others = players.filter((player) => player.id !== room.youId);
+    const locked = Boolean(room.settingsLocked);
+    if (mpSettingsLock) mpSettingsLock.hidden = !locked;
+
+    const mine = me?.preferredMaxMistakes;
+    mpMistakeOptions.replaceChildren();
+    for (const option of MISTAKE_LIMIT_OPTIONS) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'mistake-option';
+      button.dataset.action = 'set-mistakes';
+      button.dataset.value = String(option);
+      button.setAttribute('role', 'radio');
+      button.setAttribute('aria-checked', option === mine ? 'true' : 'false');
+      button.textContent = mistakeLimitLabel(option);
+      button.disabled = locked || !me?.connected;
+      mpMistakeOptions.appendChild(button);
+    }
+
+    const agreed = room.maxMistakes;
+    const hasAgreement = agreed !== null && agreed !== undefined;
+    if (mpSettingsSummary) {
+      if (hasAgreement) {
+        mpSettingsSummary.textContent = `Agreed limit: ${mistakeLimitLabel(agreed)}`;
+      } else if (others.length) {
+        mpSettingsSummary.textContent = 'Waiting for both players to agree on a mistake limit.';
+      } else {
+        mpSettingsSummary.textContent = 'Waiting for an opponent to join.';
+      }
+    }
+
+    if (mpSettingsWarning) {
+      const mismatch = others.length > 0 && others.some((player) => player.preferredMaxMistakes !== mine);
+      if (mismatch && !locked) {
+        const theirs = others.map((player) => `${player.name} picked ${mistakeLimitLabel(player.preferredMaxMistakes)}`).join(', ');
+        mpSettingsWarning.textContent = `Settings mismatch — you picked ${mistakeLimitLabel(mine)}; ${theirs}. Both players must pick the same limit.`;
+        mpSettingsWarning.hidden = false;
+      } else {
+        mpSettingsWarning.hidden = true;
+      }
     }
   }
 
