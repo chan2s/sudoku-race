@@ -74,7 +74,31 @@
               <span class="timer-label">TIME</span>
               <span id="game-timer" class="timer" aria-live="off">00:00</span>
             </div>
-          </header>          <p id="mistake-flash" class="mistake-flash" role="status" aria-live="assertive" hidden></p>
+          </header>
+
+          <!-- Top-of-game toolbar: message icon (mobile chat) and the voice
+               call control live here, next to the header — never over the
+               board, number pad or player cards. -->
+          <div id="mp-tools" class="mp-tools" hidden>
+            <button class="tool-btn chat-btn" id="chat-btn" type="button" data-action="open-chat" hidden aria-label="Open chat">
+              <span class="tool-icon" aria-hidden="true">💬</span><span class="tool-label">Chat</span>
+              <span class="chat-badge" id="chat-badge" hidden></span>
+            </button>
+            <button class="tool-btn call-btn" id="call-btn" type="button" data-action="start-call" hidden aria-label="Start voice call">
+              <span class="tool-icon" aria-hidden="true">📞</span><span class="tool-label">Call</span>
+            </button>
+          </div>
+
+          <div id="voice-panel" class="voice-panel" role="group" aria-label="Voice call" hidden data-state="idle">
+            <span class="voice-peer" id="voice-peer">Opponent</span>
+            <span class="voice-status" id="voice-status"></span>
+            <span class="voice-muted" id="voice-muted" hidden>Mic off</span>
+            <span class="voice-remote-muted" id="voice-remote-muted" hidden>They are muted</span>
+            <button class="btn btn-sm" type="button" id="voice-mute" data-action="toggle-mute" aria-pressed="false">Mute</button>
+            <button class="btn btn-sm btn-danger" type="button" id="voice-end" data-action="end-call">End</button>
+          </div>
+
+          <p id="mistake-flash" class="mistake-flash" role="status" aria-live="assertive" hidden></p>
 
           <!-- Incoming-chat notifications: a dedicated strip that reserves its
                own space above the board so it can never overlap the grid. -->
@@ -162,11 +186,7 @@
             </div>
           </aside>
 
-          <!-- Mobile chat: compact button + bottom sheet (hidden on desktop widths). -->
-          <button class="chat-btn" id="chat-btn" type="button" data-action="open-chat" hidden aria-label="Open chat">
-            💬 Chat<span class="chat-badge" id="chat-badge" hidden></span>
-          </button>
-
+          <!-- Mobile chat bottom sheet (hidden on desktop widths). -->
           <div id="chat-mobile-panel" class="chat-mobile-panel" hidden aria-label="Chat">
             <div class="chat-mobile-head">
               <h3 class="chat-mobile-title">Chat</h3>
@@ -187,6 +207,28 @@
               <button class="btn btn-primary btn-sm" type="button" id="chat-mobile-send" disabled aria-label="Send message">
                 Send
               </button>
+            </div>
+          </div>
+
+          <!-- Incoming voice call: a blocking prompt, kept separate from chat
+               toasts so the two can never collide. -->
+          <div
+            id="call-overlay"
+            class="call-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="call-overlay-title"
+            hidden
+          >
+            <div class="overlay-card">
+              <h3 id="call-overlay-title">Incoming voice call</h3>
+              <p class="call-overlay-text">
+                <strong id="call-overlay-name">Opponent</strong> is calling.
+              </p>
+              <div class="overlay-actions">
+                <button class="btn btn-primary" type="button" data-action="call-accept">Accept</button>
+                <button class="btn" type="button" data-action="call-decline">Decline</button>
+              </div>
             </div>
           </div>
         </section>

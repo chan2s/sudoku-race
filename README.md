@@ -67,6 +67,11 @@ sudoku/
 │   ├── storage.js        # StorageManager: IndexedDB abstraction with localStorage fallback
 │   ├── sync.js           # SyncManager: offline queue, retries/backoff, cross-tab bus
 │   ├── multiplayer.js    # MultiplayerClient: WebSocket protocol, reconnect, session restore
+│   ├── chat.js           # ChatClient: server-authoritative room chat (no own socket)
+│   ├── chat-ui.js        # ChatUI: desktop side panel + mobile bottom sheet
+│   ├── chat-toast.js     # ChatToast: single-slot incoming-message notification
+│   ├── voice.js          # VoiceCall: WebRTC audio calls (signaling over the room socket)
+│   ├── voice-ui.js       # VoiceUI: tool button, in-call panel, incoming-call modal
 │   └── ui.js             # UI layer: renders state and reports user intent (no game rules)
 │
 ├── assets/               # SVG + generated PNG icons (192/512/maskable)
@@ -191,6 +196,10 @@ Client → server:
 | `PLAYER_MOVE` | one cell submitted for validation (`{cell, value}`) — the server decides correctness |
 | `PLAYER_COMPLETED` | finished board (`{board, clientTimestamp}`) — the timestamp is advisory only |
 | `REQUEST_STATE` | ask for the authoritative snapshot (sent on reconnect) |
+| `PLAYER_SETTINGS` | pre-game lobby: propose a mistake limit `{roomId, maxMistakes}` |
+| `CALL_CONFIG` | request this player's ICE servers (STUN + ephemeral TURN) |
+| `CALL_INVITE` / `CALL_ACCEPT` / `CALL_DECLINE` / `CALL_END` | voice-call lifecycle for the room |
+| `CALL_SIGNAL` | opaque SDP/ICE relayed only to the opponent `{roomId, signal}` |
 | `LEAVE_ROOM` / `PING` | leave the table / keepalive |
 
 Server → client: `ROOM_CREATED`, `ROOM_STATE`, `PLAYER_JOINED`, `PLAYER_LEFT`, `PLAYER_READY`,
@@ -245,7 +254,43 @@ Invalid submissions produce `ERROR INVALID_SOLUTION` and are logged — no resul
 `clientTimestamp` values are ignored entirely, so a hacked clock or a fake `{winner: true}` message
 changes nothing (`WINNER` is not even a known message type; unknown types are rejected explicitly).
 
-### 4.5 Mistake limit
+### 4.5 Voice calls (WebRTC)
+
+Multiplayer rooms support **real, audio-only peer-to-peer voice calls**. There is no second backend:
+signaling reuses the authenticated room WebSocket, and audio never touches the server.
+
+* **Signaling.** `CALL_INVITE` rings the opponent; `CALL_ACCEPT` / `CALL_DECLINE` answer it; `CALL_END`
+hangs up; `CALL_SIGNAL` carries the SDP offer/answer, trickled ICE candidates and a tiny mute flag.
+The server never inspects or stores the payload — it only enforces *who may talk to whom*: sender and
+recipient are resolved from the socket's own room membership (a client-supplied `roomId` is never
+trusted), the call must be in a valid state, and signaling is relayed to the opponent alone. Chat
+and voice messages can never change Sudoku state.
+* **ICE configuration.** `CALL_CONFIG` returns the ICE servers *for that player* over the authenticated
+socket. STUN is public; when TURN is configured the server mints **short-lived HMAC credentials**
+(the coturn REST API scheme) so the shared secret is never sent to a client, logged, or committed.
+* **Media.** The client uses `RTCPeerConnection` + `getUserMedia` (audio only), attaches the remote
+track to a managed `<audio>` element and plays it (autoplay is handled gracefully). The microphone is
+requested only when a player starts or accepts a call — never on entering a room. Tracks and peer
+connections are released on end, decline, timeout, opponent disconnect/leave, match end, socket loss
+and page teardown; audio is never recorded or persisted.
+* **Timeouts.** Unanswered calls ring for 45 s (`CALL_RING_TIMEOUT_MS`) and are cleared on both ends;
+the client adds ring/connect/reconnect guards and clears stale state.
+
+Configuration (all optional; see the server's `process.env` reads):
+
+| Variable | Purpose |
+| --- | --- |
+| `STUN_URLS` | Comma-separated STUN URLs (default `stun:stun.l.google.com:19302`) |
+| `TURN_URLS` | Comma-separated TURN URLs, e.g. `turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349` |
+| `TURN_STATIC_SECRET` | Shared secret for coturn's `static-auth-secret` (drives ephemeral credentials) |
+| `TURN_TTL_SECONDS` | Lifetime of a minted credential (default 3600) |
+| `CALL_RING_TIMEOUT_MS` | How long an unanswered call rings (default 45000) |
+
+HTTPS is required in production for `getUserMedia` (localhost is treated as secure). A production
+deployment therefore needs TLS termination in front of the server plus a reachable TURN service; STUN
+alone works only when a direct path exists.
+
+### 4.6 Mistake limit
 
 A race also ends when a player makes **3 mistakes**. Every entered value is validated against the
 server's own solution; an incorrect one increments that player's server-owned `mistakes` counter
@@ -266,7 +311,7 @@ marks the player `eliminated`, awards the win to the opponent and broadcasts `GA
 * Explicit result reasons are stored with every finish: `PLAYER_COMPLETED`, `OPPONENT_COMPLETED`,
   `OPPONENT_MISTAKE_LIMIT` and `OPPONENT_ABANDONED`.
 
-### 4.6 Sync API (optional)
+### 4.7 Sync API (optional)
 
 `POST /api/sync` accepts one record `{ id, type, payload, createdAt, updatedAt }` and returns
 `{ ok, duplicate, stored, stats }`. Records are idempotent by id, so retries after a flaky connection
@@ -311,13 +356,13 @@ npm run smoke     # real browser: gameplay, refresh, offline, sync, two-tab race
 | --- | --- | --- |
 | `tools/test-standalone.mjs` | 6 | the frontend on a plain static host (`/api` and `/ws` return 404): the game starts, plays, keeps its timer, survives a sync failure, restores after a reload and degrades gracefully on the multiplayer screen — i.e. **the Sudoku game works without the backend** |
 | `tools/test-sudoku.mjs` | 35 | unique solutions, solver agreement, clue bands, deterministic seeds, duplicate detection, timer pause/refresh, engine rules (givens, mistakes, undo, pause, restart, completion, serialization, corruption), StorageManager round-trips and the sync queue |
-| `tools/test-multiplayer.mjs` | 29 | server boot, static hosting, path-traversal blocking, room create/join/full/not-found, state relay to both players, identical seeded puzzle, progress relay without echo, clue tampering, **server-decided winner**, late finisher, rematch, cheat rejection, reconnect with replay, **3-mistake elimination + `OPPONENT_MISTAKE_LIMIT` + rejected post-game move + client-manipulation rejection + mistake persistence across reconnect**, sync idempotency, abandonment, rate limiting |
-| `tools/browser-smoke.mjs` | 28 | headless Chrome through the real UI: board/a11y, timer, mouse+keyboard play, peers, givens, mistakes/undo, pause, **refresh continuity**, **offline play**, **offline reload via service worker**, queue drain → `✓ Synced`, completion + stats, **two-tab race with an identical puzzle and an authoritative winner**, **3-mistake elimination with the game-over/you-win overlays and chat still open**, opponent drop/rejoin, lobby leave, 390×844 layout, zero console errors |
+| `tools/test-multiplayer.mjs` | 39 | server boot, static hosting, path-traversal blocking, room create/join/full/not-found, state relay to both players, identical seeded puzzle, progress relay without echo, clue tampering, **server-decided winner**, late finisher, rematch, cheat rejection, reconnect with replay, **3-mistake elimination + `OPPONENT_MISTAKE_LIMIT` + rejected post-game move + client-manipulation rejection + mistake persistence across reconnect**, **pre-game settings agreement/mismatch/readiness/unlimited**, **voice signaling (invite/accept/decline/signal/end), busy + invalid states, no-answer timeout, peer-disconnect, cross-room rejection, and ephemeral TURN credentials that never leak the secret**, sync idempotency, abandonment, rate limiting |
+| `tools/browser-smoke.mjs` | 33 | headless Chrome through the real UI: board/a11y, timer, mouse+keyboard play, peers, givens, mistakes/undo, pause, **refresh continuity**, **offline play**, **offline reload via service worker**, queue drain → `✓ Synced`, completion + stats, **two-tab race with an identical puzzle and an authoritative winner**, **3-mistake elimination with the game-over/you-win overlays and chat still open**, **lobby settings gating**, **chat beside the board + board-safe toast**, **mobile chat sheet**, **a real two-tab WebRTC audio call over fake devices (connect, remote audio, mute, teardown)**, opponent drop/rejoin, lobby leave, 390×844 layout, zero console errors |
 
 The suites were written before/while building and each failure was investigated rather than relaxed;
 screenshots from the browser run land in `tools/screenshots/`.
 
-All three suites are green: **98 checks (35 + 29 + 6 + 28), 0 failures, 0 browser console errors.**
+All suites are green: **113 checks (35 + 39 + 6 + 33), 0 failures, 0 browser console errors.**
 
 Known limits (honest list):
 
@@ -326,5 +371,9 @@ Known limits (honest list):
 * Sync state on the demo backend is in-memory (the sync API is a demonstration endpoint). Rooms and
   results are equally in-memory; a production deployment would persist them and add accounts.
 * Multiplayer matches two players per room and does not implement matchmaking or spectating.
+* Voice calls are verified end-to-end between two tabs on one machine (two real `RTCPeerConnection`s
+  over fake media devices). Cross-network connectivity, real microphones and TURN relay fallbacks
+  are **not** covered by the automated suite — they need a TURN service and TLS in production, and
+  should be tested on the target networks.
 * Chrome/Edge is required for the browser suite (`CHROME_PATH` overrides detection), and
   `tools/browser-smoke.mjs` exits with code 2 when no browser is found.

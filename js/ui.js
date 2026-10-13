@@ -110,6 +110,18 @@ export class UI {
       chatMobileClose: $('chat-mobile-close'),
       chatMobileBadge: $('chat-badge'),
       chatToasts: $('chat-toasts'),
+      // voice calls
+      mpTools: $('mp-tools'),
+      callBtn: $('call-btn'),
+      voicePanel: $('voice-panel'),
+      voicePeer: $('voice-peer'),
+      voiceStatus: $('voice-status'),
+      voiceMuted: $('voice-muted'),
+      voiceRemoteMuted: $('voice-remote-muted'),
+      voiceMute: $('voice-mute'),
+      voiceEnd: $('voice-end'),
+      callOverlay: $('call-overlay'),
+      callOverlayName: $('call-overlay-name'),
       // multiplayer lobby (pre-game settings)
       mpSettings: $('mp-settings'),
       mpSettingsLock: $('mp-settings-lock'),
@@ -264,6 +276,21 @@ export class UI {
       case 'close-chat':
         this.handlers.onCloseChat?.();
         break;
+      case 'start-call':
+        this.handlers.onStartCall?.();
+        break;
+      case 'call-accept':
+        this.handlers.onAcceptCall?.();
+        break;
+      case 'call-decline':
+        this.handlers.onDeclineCall?.();
+        break;
+      case 'end-call':
+        this.handlers.onEndCall?.();
+        break;
+      case 'toggle-mute':
+        this.handlers.onToggleMute?.();
+        break;
       case 'save-settings':
         this.handlers.onSaveSettings?.(this.readSettingsForm());
         break;
@@ -288,7 +315,13 @@ export class UI {
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
       // Chat surfaces own their keys: a focused send button or anything inside
       // the chat panels must never pause the race or edit a Sudoku cell.
-      if (event.target?.closest?.('#chat-panel, #chat-mobile-panel, #chat-btn, #chat-toasts')) return;
+      if (
+        event.target?.closest?.(
+          '#chat-panel, #chat-mobile-panel, #chat-btn, #chat-toasts, #mp-tools, #voice-panel, #call-overlay',
+        )
+      ) {
+        return;
+      }
       if (this.currentScreen !== 'game' || !this.engine) return;
       const key = event.key;
 

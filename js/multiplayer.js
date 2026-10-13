@@ -44,7 +44,45 @@ export const MP = {
   CHAT_HISTORY: 'CHAT_HISTORY',
   CHAT_ERROR: 'CHAT_ERROR',
   CHAT_RATE_LIMITED: 'CHAT_RATE_LIMITED',
+  // voice calls — signaling rides the same authenticated room socket
+  CALL_CONFIG: 'CALL_CONFIG',
+  CALL_INVITE: 'CALL_INVITE',
+  CALL_ACCEPT: 'CALL_ACCEPT',
+  CALL_DECLINE: 'CALL_DECLINE',
+  CALL_END: 'CALL_END',
+  CALL_SIGNAL: 'CALL_SIGNAL',
+  CALL_INCOMING: 'CALL_INCOMING',
+  CALL_ACCEPTED: 'CALL_ACCEPTED',
+  CALL_DECLINED: 'CALL_DECLINED',
+  CALL_ENDED: 'CALL_ENDED',
+  CALL_STATE: 'CALL_STATE',
+  CALL_ERROR: 'CALL_ERROR',
 };
+
+/** Voice-call lifecycle states shown by the call panel. */
+export const CALL_STATE = {
+  IDLE: 'idle',
+  OUTGOING: 'outgoing',
+  INCOMING: 'incoming',
+  CONNECTING: 'connecting',
+  CONNECTED: 'connected',
+  RECONNECTING: 'reconnecting',
+  ENDED: 'ended',
+};
+
+export const CALL_ERRORS = {
+  UNSUPPORTED: 'CALL_UNSUPPORTED',
+  MIC_DENIED: 'CALL_MIC_DENIED',
+  BUSY: 'CALL_BUSY',
+  NOT_IN_ROOM: 'CALL_NOT_IN_ROOM',
+  PEER_UNAVAILABLE: 'CALL_PEER_UNAVAILABLE',
+  INVALID_STATE: 'CALL_INVALID_STATE',
+  FAILED: 'CALL_FAILED',
+  UNAVAILABLE: 'CALL_UNAVAILABLE',
+};
+
+/** How long an unanswered call rings before it is cleared on both ends. */
+export const CALL_RING_TIMEOUT_MS = 45000;
 
 /**
  * Maximum mistakes a player may make in a multiplayer race before the server
@@ -345,6 +383,10 @@ export class MultiplayerClient extends Emitter {
     }
     // Progress events are superseded by the next one, so keep only the latest
     // per cell to avoid flooding the server after a long offline stretch.
+    // Voice signaling is only meaningful on a live socket: replaying stale
+    // offers/ICE after a reconnect would create ghost calls, so it is dropped
+    // instead of queued (progress and chat still queue).
+    if (/^CALL_/.test(payload.type)) return false;
     if (payload.type === MP.PLAYER_PROGRESS) {
       this.outbox = this.outbox.filter(
         (item) => !(item.type === MP.PLAYER_PROGRESS && item.cell === payload.cell),
@@ -443,6 +485,33 @@ export class MultiplayerClient extends Emitter {
     return this.send({ type: MP.CHAT_HISTORY, roomId: this.roomId() });
   }
 
+  /* --------------------------- voice calls -------------------------- */
+
+  requestCallConfig() {
+    return this.send({ type: MP.CALL_CONFIG, roomId: this.roomId() });
+  }
+
+  sendCallInvite() {
+    return this.send({ type: MP.CALL_INVITE, roomId: this.roomId() });
+  }
+
+  sendCallAccept() {
+    return this.send({ type: MP.CALL_ACCEPT, roomId: this.roomId() });
+  }
+
+  sendCallDecline() {
+    return this.send({ type: MP.CALL_DECLINE, roomId: this.roomId() });
+  }
+
+  sendCallEnd(reason = 'ended') {
+    return this.send({ type: MP.CALL_END, roomId: this.roomId(), reason });
+  }
+
+  /** Opaque SDP/ICE payload relayed only to the opponent in this room. */
+  sendCallSignal(signal) {
+    return this.send({ type: MP.CALL_SIGNAL, roomId: this.roomId(), signal });
+  }
+
   /** Server clock best estimate — deadlines are compared against this. */
   serverNow() {
     return Date.now() + this.clockOffsetMs;
@@ -538,6 +607,8 @@ export class MultiplayerClient extends Emitter {
       case MP.ERROR:
         if (message.code === 'CHAT_RATE_LIMITED') {
           this.emit('chat-error', { code: 'CHAT_RATE_LIMITED', message: message.message });
+        } else if (typeof message.code === 'string' && message.code.startsWith('CALL_')) {
+          this.emit('call-error', { code: message.code, message: message.message });
         } else {
           this.emit('server-error', { code: message.code, message: message.message });
         }
@@ -553,6 +624,30 @@ export class MultiplayerClient extends Emitter {
         break;
       case MP.CHAT_ERROR:
         this.emit('chat-error', message);
+        break;
+      case MP.CALL_CONFIG:
+        this.emit('call-config', Array.isArray(message.iceServers) ? message.iceServers : []);
+        break;
+      case MP.CALL_INCOMING:
+        this.emit('call-incoming', message);
+        break;
+      case MP.CALL_ACCEPTED:
+        this.emit('call-accepted', message);
+        break;
+      case MP.CALL_DECLINED:
+        this.emit('call-declined', message);
+        break;
+      case MP.CALL_ENDED:
+        this.emit('call-ended', message);
+        break;
+      case MP.CALL_SIGNAL:
+        this.emit('call-signal', message);
+        break;
+      case MP.CALL_STATE:
+        this.emit('call-state', message);
+        break;
+      case MP.CALL_ERROR:
+        this.emit('call-error', message);
         break;
       default:
         break;

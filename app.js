@@ -12,6 +12,7 @@ import { SyncManager, CrossTab, SYNC_STATUS, mergeStats } from './js/sync.js';
 import {
   MultiplayerClient,
   CONNECTION_STATE,
+  CALL_STATE,
   MP_ERRORS,
   normalizeMistakeLimit,
   defaultMultiplayerUrl,
@@ -20,6 +21,8 @@ import {
 import { ChatClient } from './js/chat.js';
 import { ChatUI } from './js/chat-ui.js';
 import { ChatToast } from './js/chat-toast.js';
+import { VoiceCall } from './js/voice.js';
+import { VoiceUI } from './js/voice-ui.js';
 import { UI } from './js/ui.js';
 import { formatTime } from './js/timer.js';
 
@@ -48,6 +51,8 @@ class SudokuApp {
     this.chat = null;
     this.chatUI = null;
     this.chatToast = null;
+    this.voice = null;
+    this.voiceUI = null;
     this.engine = null;
     this.settings = { ...DEFAULT_SETTINGS, playerName: '' };
     this.stats = defaultStats();
@@ -76,6 +81,11 @@ class SudokuApp {
       onLeaveRoom: () => this.leaveRoom(),
       onOpenChat: () => this.openMultiplayerChat(),
       onCloseChat: () => this.chatUI?.closeMobileChat(),
+      onStartCall: () => this.startVoiceCall(),
+      onAcceptCall: () => this.voice?.accept(),
+      onDeclineCall: () => this.voice?.decline(),
+      onEndCall: () => this.voice?.hangup('ended'),
+      onToggleMute: () => this.voice?.toggleMute(),
       onSaveSettings: (patch) => this.saveSettings(patch),
       onExportData: () => this.exportData(),
       onClearData: () => this.clearData(),
@@ -295,7 +305,12 @@ class SudokuApp {
     const show = Boolean(this.client?.room) && this.engine?.mode === 'multiplayer';
     if (el.chatPanel) el.chatPanel.hidden = !show;
     if (el.chatBtn) el.chatBtn.hidden = !show;
+    // The tool strip (message icon + call button) belongs to the top area.
+    if (el.mpTools) el.mpTools.hidden = !show;
+    const matchActive = show && this.client?.room?.status === 'playing';
+    if (el.callBtn) el.callBtn.hidden = !matchActive;
     if (!show) this.chatUI?.closeMobileChat();
+    this.voiceUI?.refresh();
     // Widen the app shell only while a race needs the two-column layout.
     document.querySelector('.screens')?.classList.toggle('screens--wide', show);
     el.chatPanel?.closest('.screen')?.classList.toggle('mp-active', show);
@@ -304,6 +319,18 @@ class SudokuApp {
   openMultiplayerChat() {
     if (!this.chatUI || !this.client?.room) return;
     if (this.isMobileLayout()) this.chatUI.openMobileChat();
+  }
+
+  /* ---------------------------- voice calls ----------------------- */
+
+  startVoiceCall() {
+    if (!this.voice) return;
+    if (!this.voice.canStart()) {
+      if (this.voice.state !== CALL_STATE.IDLE) return; // already in a call
+      this.ui.showToast('Voice calls are available during a live match');
+      return;
+    }
+    this.voice.start();
   }
 
   /* --------------------------- screens ---------------------------- */
@@ -752,6 +779,13 @@ class SudokuApp {
       this.chat.on('message', (message) => this.onIncomingChatMessage(message, client));
     }
 
+    // Voice calls are layered on the same authenticated room socket.
+    if (!this.voice) {
+      this.voice = new VoiceCall({ client });
+      this.voice.attach();
+      this.voiceUI = new VoiceUI({ ui: this.ui, elements: this.ui.elements, voice: this.voice });
+    }
+
     return client;
   }
 
@@ -856,6 +890,10 @@ class SudokuApp {
   }
 
   teardownMultiplayer() {
+    this.voice?.destroy();
+    this.voiceUI?.detachVoice();
+    this.voice = null;
+    this.voiceUI = null;
     this.chatUI?.detachChat();
     this.chat?.detach();
     this.chatToast?.dismiss();

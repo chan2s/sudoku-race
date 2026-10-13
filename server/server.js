@@ -19,6 +19,7 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHmac } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { generatePuzzle, isValidSolution } from '../js/sudoku.js';
 import { MP, MAX_MISTAKES } from '../js/multiplayer.js';
@@ -53,6 +54,22 @@ const MISTAKE_LIMIT_OPTIONS = [1, 2, 3, 5, 0];
 const CHAT_RATE_WINDOW_MS = 1000;
 const MAX_CHAT_HISTORY = 200;
 const MAX_SYNC_RECORDS = 5000;
+// Voice calls: ICE configuration is delivered per-player over the authenticated
+// socket. The public STUN list is safe to share; TURN uses short-lived HMAC
+// credentials derived from `TURN_STATIC_SECRET`, so the shared secret itself is
+// never sent to a client. See README "Voice calls" for deployment notes.
+const STUN_URLS = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302')
+  .split(',')
+  .map((url) => url.trim())
+  .filter(Boolean);
+const TURN_URLS = (process.env.TURN_URLS || '')
+  .split(',')
+  .map((url) => url.trim())
+  .filter(Boolean);
+const TURN_STATIC_SECRET = process.env.TURN_STATIC_SECRET || '';
+const TURN_TTL_SECONDS = Math.max(60, Math.min(24 * 3600, Number(process.env.TURN_TTL_SECONDS) || 3600));
+const CALL_RING_TIMEOUT_MS = Number(process.env.CALL_RING_TIMEOUT_MS) || 45 * 1000;
+const MAX_SIGNAL_BYTES = 20 * 1024;
 
 /** Result vocabulary — `resultReason` travels with every finished race. */
 const RESULT_REASONS = {
@@ -255,6 +272,8 @@ async function loadRooms() {
         ...stored,
         players: new Map(),
         chatHistory: Array.isArray(stored.chatHistory) ? stored.chatHistory.slice(-MAX_CHAT_HISTORY) : [],
+        // A restart tears every call down; signaling is socket-bound anyway.
+        call: null,
       };
       for (const storedPlayer of stored.players || []) {
         const player = {
@@ -330,6 +349,8 @@ function createRoom(playerId, name, difficulty) {
     results: null,
     maxMistakes: MAX_MISTAKES,
     chatHistory: [],
+    // Active voice call (transient: never persisted, never survives a restart).
+    call: null,
     players: new Map(),
   };
   rooms.set(code, room);
@@ -460,6 +481,7 @@ function resetForRematch(room) {
   room.eliminatedPlayerId = null;
   room.finishedAt = null;
   room.startedAt = null;
+  endCall(room, 'match-ended');
   for (const player of room.players.values()) {
     player.ready = false;
     player.completed = false;
@@ -734,6 +756,8 @@ function finishGame(
   room.resultReason = resultReason;
   room.abandonedPlayerId = abandonedPlayerId;
   room.eliminatedPlayerId = eliminatedPlayerId;
+  // A finished match cannot keep an audio call alive.
+  endCall(room, 'match-ended');
   // The loser is whoever did not win — stored explicitly for the result message.
   if (room.winnerId) {
     const other = Array.from(room.players.values()).find((player) => player.id !== room.winnerId);
@@ -827,6 +851,10 @@ function markDisconnected(room, player) {
   player.disconnectedAt = now();
   player.reconnectDeadline = player.disconnectedAt + RECONNECT_TIMEOUT_MS;
   player.socket = null;
+  // A peer cannot relay audio while its socket is gone; end any live call.
+  if (room.call && (room.call.callerId === player.id || room.call.calleeId === player.id)) {
+    endCall(room, 'peer-disconnected');
+  }
   room.lastActivity = player.disconnectedAt;
   schedulePersist();
 
@@ -1166,6 +1194,30 @@ function handleClientMessage(socket, message) {
       handleChatHistoryRequest(socket);
       break;
 
+    case MP.CALL_CONFIG:
+      handleCallConfig(socket);
+      break;
+
+    case MP.CALL_INVITE:
+      handleCallInvite(socket);
+      break;
+
+    case MP.CALL_ACCEPT:
+      handleCallAccept(socket);
+      break;
+
+    case MP.CALL_DECLINE:
+      handleCallDecline(socket);
+      break;
+
+    case MP.CALL_END:
+      handleCallEnd(socket, message);
+      break;
+
+    case MP.CALL_SIGNAL:
+      handleCallSignal(socket, message);
+      break;
+
     case MP.CREATE_ROOM: {
       const room = createRoom(playerId, message.name, message.difficulty || 'medium');
       const player = addPlayer(room, { id: playerId, name: message.name, socket });
@@ -1409,6 +1461,9 @@ function handleClientMessage(socket, message) {
           finishGame(room, 'Both players left', { resultReason: RESULT_REASONS.PLAYER_ABANDONED });
         }
       }
+      if (room.call && (room.call.callerId === playerId || room.call.calleeId === playerId)) {
+        endCall(room, 'peer-left');
+      }
       if (player) clearDisconnectTimer(player);
       room.players.delete(playerId);
       schedulePersist();
@@ -1515,6 +1570,212 @@ function handleChatHistoryRequest(socket) {
   });
 }
 
+/* ------------------------------ voice calls ----------------------------- */
+/*
+ * Signaling rides the same authenticated room socket as chat. The server never
+ * inspects or stores SDP/ICE payloads — it only enforces *who may talk to whom*:
+ * both participants must be members of the same room, resolved from the socket
+ * itself (never from a client-supplied id), and the call must be in a valid
+ * state. Media flows peer-to-peer via WebRTC; no audio touches this server.
+ */
+
+function sendCallError(socket, code, message) {
+  send(socket, { type: MP.ERROR, code, message });
+}
+
+function otherPlayer(room, playerId) {
+  return Array.from(room.players.values()).find((player) => player.id !== playerId) || null;
+}
+
+function clearCallTimer(call) {
+  if (call?.ringTimer) {
+    clearTimeout(call.ringTimer);
+    call.ringTimer = null;
+  }
+}
+
+/** Ends the room's live call (if any) and tells both participants. */
+function endCall(room, reason, { endedBy = null } = {}) {
+  const call = room.call;
+  if (!call) return;
+  clearCallTimer(call);
+  room.call = null;
+  broadcast(room, {
+    type: MP.CALL_ENDED,
+    roomId: room.id,
+    reason,
+    endedBy,
+    callerId: call.callerId,
+    calleeId: call.calleeId,
+    serverTime: now(),
+  });
+}
+
+/**
+ * Per-player ICE servers. STUN is public; TURN credentials are ephemeral
+ * (coturn REST API style) so the shared secret never leaves the server.
+ */
+function buildIceServers(playerId) {
+  const servers = [];
+  if (STUN_URLS.length) servers.push({ urls: STUN_URLS });
+  if (TURN_URLS.length && TURN_STATIC_SECRET) {
+    const expiry = Math.floor(now() / 1000) + TURN_TTL_SECONDS;
+    const username = `${expiry}:${playerId}`;
+    const credential = createHmac('sha1', TURN_STATIC_SECRET).update(username).digest('base64');
+    servers.push({ urls: TURN_URLS, username, credential });
+  }
+  return servers;
+}
+
+function handleCallConfig(socket) {
+  const member = roomForSocket(socket);
+  if (!member) {
+    sendCallError(socket, 'CALL_NOT_IN_ROOM', 'Join a room before requesting call settings');
+    return;
+  }
+  // Only the ICE configuration is returned — never the TURN shared secret.
+  send(socket, { type: MP.CALL_CONFIG, roomId: member.room.id, iceServers: buildIceServers(member.player.id) });
+}
+
+function handleCallInvite(socket) {
+  const member = roomForSocket(socket);
+  if (!member) {
+    sendCallError(socket, 'CALL_NOT_IN_ROOM', 'Voice calls require an active room');
+    return;
+  }
+  const { room, player } = member;
+  if (room.status !== 'playing') {
+    sendCallError(socket, 'CALL_UNAVAILABLE', 'Voice calls are available during a match');
+    return;
+  }
+  if (room.call) {
+    sendCallError(socket, 'CALL_BUSY', 'A call is already in progress');
+    return;
+  }
+  const opponent = otherPlayer(room, player.id);
+  if (!opponent || !opponent.connected || !opponent.socket) {
+    sendCallError(socket, 'CALL_PEER_UNAVAILABLE', 'Your opponent is not connected');
+    return;
+  }
+
+  const call = { status: 'ringing', callerId: player.id, calleeId: opponent.id, startedAt: now(), ringTimer: null };
+  room.call = call;
+  call.ringTimer = setTimeout(() => {
+    if (room.call === call && call.status === 'ringing') endCall(room, 'no-answer');
+  }, CALL_RING_TIMEOUT_MS);
+  if (call.ringTimer.unref) call.ringTimer.unref();
+
+  send(opponent.socket, {
+    type: MP.CALL_INCOMING,
+    roomId: room.id,
+    from: { id: player.id, name: player.name },
+    serverTime: now(),
+  });
+  send(socket, {
+    type: MP.CALL_STATE,
+    roomId: room.id,
+    state: 'ringing',
+    role: 'caller',
+    peer: { id: opponent.id, name: opponent.name },
+    serverTime: now(),
+  });
+}
+
+function handleCallAccept(socket) {
+  const member = roomForSocket(socket);
+  if (!member) {
+    sendCallError(socket, 'CALL_NOT_IN_ROOM', 'Voice calls require an active room');
+    return;
+  }
+  const { room, player } = member;
+  const call = room.call;
+  if (!call || call.status !== 'ringing' || call.calleeId !== player.id) {
+    sendCallError(socket, 'CALL_INVALID_STATE', 'There is no incoming call to accept');
+    return;
+  }
+  clearCallTimer(call);
+  call.status = 'active';
+  const caller = room.players.get(call.callerId);
+  send(socket, {
+    type: MP.CALL_STATE,
+    roomId: room.id,
+    state: 'active',
+    role: 'callee',
+    peer: caller ? { id: caller.id, name: caller.name } : null,
+    serverTime: now(),
+  });
+  if (caller?.socket) {
+    send(caller.socket, {
+      type: MP.CALL_ACCEPTED,
+      roomId: room.id,
+      from: { id: player.id, name: player.name },
+      serverTime: now(),
+    });
+  }
+}
+
+function handleCallDecline(socket) {
+  const member = roomForSocket(socket);
+  if (!member) return;
+  const { room, player } = member;
+  const call = room.call;
+  if (!call || call.calleeId !== player.id) {
+    sendCallError(socket, 'CALL_INVALID_STATE', 'There is no incoming call to decline');
+    return;
+  }
+  clearCallTimer(call);
+  room.call = null;
+  const caller = room.players.get(call.callerId);
+  if (caller?.socket) {
+    send(caller.socket, {
+      type: MP.CALL_DECLINED,
+      roomId: room.id,
+      from: { id: player.id, name: player.name },
+      serverTime: now(),
+    });
+  }
+  send(socket, { type: MP.CALL_STATE, roomId: room.id, state: 'idle', serverTime: now() });
+}
+
+function handleCallEnd(socket, message) {
+  const member = roomForSocket(socket);
+  if (!member) return;
+  const { room, player } = member;
+  const call = room.call;
+  if (!call) return;
+  if (call.callerId !== player.id && call.calleeId !== player.id) return;
+  const reason = typeof message.reason === 'string' ? message.reason.slice(0, 40) : 'ended';
+  endCall(room, reason, { endedBy: player.id });
+}
+
+function handleCallSignal(socket, message) {
+  const member = roomForSocket(socket);
+  if (!member) return;
+  const { room, player } = member;
+  const call = room.call;
+  if (!call) return;
+  if (call.callerId !== player.id && call.calleeId !== player.id) return;
+  const signal = message.signal;
+  if (!signal || typeof signal !== 'object' || Array.isArray(signal)) return;
+  let serialized;
+  try {
+    serialized = JSON.stringify(signal);
+  } catch {
+    return; // circular / unserializable payloads are dropped, never relayed
+  }
+  if (serialized.length > MAX_SIGNAL_BYTES) return;
+  // The payload is opaque and forwarded only to the opponent in this room.
+  const target = otherPlayer(room, player.id);
+  if (!target?.socket) return;
+  send(target.socket, {
+    type: MP.CALL_SIGNAL,
+    roomId: room.id,
+    from: { id: player.id, name: player.name },
+    signal,
+    serverTime: now(),
+  });
+}
+
 /* ------------------------------- upkeep --------------------------------- */
 
 // Heartbeat: drop half-open sockets so the opponent sees an honest status.
@@ -1567,6 +1828,7 @@ const cleanup = setInterval(() => {
     }
     const anyConnected = Array.from(room.players.values()).some((player) => player.connected);
     if (!room.players.size || (!anyConnected && stamp - room.lastActivity > ROOM_TTL_MS)) {
+      if (room.call) endCall(room, 'room-closed');
       rooms.delete(room.id);
       mutated = true;
       console.log(`[server] room ${room.id} expired`);

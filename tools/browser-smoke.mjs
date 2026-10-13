@@ -331,6 +331,12 @@ const chrome = spawn(
     '--no-default-browser-check',
     '--disable-background-networking',
     '--disable-features=Translate,BackForwardCache',
+    // Fake media devices let two tabs exercise a real RTCPeerConnection with
+    // getUserMedia without a physical microphone; autoplay is allowed so the
+    // remote audio element can play without a user gesture in headless mode.
+    '--use-fake-ui-for-media-stream',
+    '--use-fake-device-for-media-stream',
+    '--autoplay-policy=no-user-gesture-required',
     `--remote-debugging-port=${DEBUG_PORT}`,
     `--user-data-dir=${userDataDir}`,
     '--window-size=1280,900',
@@ -900,6 +906,13 @@ try {
 
   await test('mobile chat opens as a bottom sheet, sends, and closing it keeps the race alive', async () => {
     assert.equal(await pageB.evaluate(`document.querySelector('#chat-btn').hidden`), false, 'the mobile chat button is available during a race');
+    const icon = await pageB.evaluate(`(() => {
+      const btn = document.querySelector('#chat-btn').getBoundingClientRect();
+      const board = document.querySelector('#board').getBoundingClientRect();
+      return { top: btn.top, bottom: btn.bottom, width: btn.width, height: btn.height, boardTop: board.top };
+    })()`);
+    assert.ok(icon.width > 0 && icon.height >= 32, 'the message icon is a real tappable target');
+    assert.ok(icon.bottom <= icon.boardTop + 1, 'the message icon sits in the top area, above the board');
     await pageB.click('#chat-btn');
     await waitFor(() => pageB.evaluate(`!document.querySelector('#chat-mobile-panel').hidden`), { label: 'mobile chat open' });
     const sheet = await pageB.evaluate(`(() => {
@@ -933,6 +946,65 @@ try {
     await waitFor(() => pageB.evaluate(`document.querySelector('#chat-mobile-panel').hidden`), { label: 'mobile chat closed' });
     const stillRunning = await pageB.evaluate(`!document.querySelector('#mp-hud').hidden && document.querySelector('#mp-opp-status').textContent.length > 0`);
     assert.equal(stillRunning, true, 'closing the chat does not disturb the race');
+  });
+
+  await test('a real WebRTC voice call connects, mutes and ends between the two tabs', async () => {
+    // Both tabs are in a live race; tab A starts an audio call.
+    await page.evaluate(`document.querySelector('#call-btn').click()`);
+    await waitFor(() => pageB.evaluate(`!document.querySelector('#call-overlay').hidden`), {
+      timeout: 10000,
+      label: 'incoming call on tab B',
+    });
+    const callerName = await pageB.evaluate(`document.querySelector('#call-overlay-name').textContent`);
+    assert.ok(callerName.trim().length > 0, 'the incoming call names the caller');
+
+    await pageB.evaluate(`document.querySelector('#call-overlay [data-action="call-accept"]').click()`);
+    await waitFor(() => page.evaluate(`document.querySelector('#voice-panel').dataset.state === 'connected'`), {
+      timeout: 20000,
+      label: 'tab A voice connected',
+    });
+    await waitFor(() => pageB.evaluate(`document.querySelector('#voice-panel').dataset.state === 'connected'`), {
+      timeout: 20000,
+      label: 'tab B voice connected',
+    });
+    // Both sides receive the opponent's audio track over a real peer connection.
+    await waitFor(() => page.evaluate(`Number(document.querySelector('#voice-panel').dataset.remoteTracks) > 0`), {
+      timeout: 10000,
+      label: 'tab A remote audio track',
+    });
+    await waitFor(() => pageB.evaluate(`Number(document.querySelector('#voice-panel').dataset.remoteTracks) > 0`), {
+      timeout: 10000,
+      label: 'tab B remote audio track',
+    });
+    const connection = await page.evaluate(`document.querySelector('#voice-panel').dataset.connection`);
+    assert.equal(connection, 'connected', 'the RTCPeerConnection reaches the connected state');
+    await page.screenshot('07-voice-call');
+
+    // Muting on A propagates to B's remote-mute indicator.
+    await page.evaluate(`document.querySelector('#voice-mute').click()`);
+    await waitFor(() => page.evaluate(`document.querySelector('#voice-panel').dataset.muted === 'true'`), {
+      label: 'tab A muted',
+    });
+    await waitFor(() => pageB.evaluate(`document.querySelector('#voice-panel').dataset.remoteMuted === 'true'`), {
+      label: 'tab B shows the remote mute',
+    });
+
+    // Ending the call releases the microphone on both ends.
+    await page.evaluate(`document.querySelector('#voice-end').click()`);
+    await waitFor(() => pageB.evaluate(`document.querySelector('#voice-panel').dataset.localActive === 'false'`), {
+      timeout: 8000,
+      label: 'tab B microphone released',
+    });
+    await waitFor(() => page.evaluate(`document.querySelector('#voice-panel').hidden === true`), {
+      timeout: 8000,
+      label: 'tab A call panel closed',
+    });
+    await waitFor(() => pageB.evaluate(`document.querySelector('#voice-panel').hidden === true`), {
+      timeout: 8000,
+      label: 'tab B call panel closed',
+    });
+    const raceStillLive = await page.evaluate(`!document.querySelector('#mp-hud').hidden && document.querySelector('#board-overlay').hidden`);
+    assert.equal(raceStillLive, true, 'ending the call does not disturb the race');
   });
 
   await test('the server declares the first finisher the winner in both tabs', async () => {

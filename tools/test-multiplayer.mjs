@@ -122,7 +122,16 @@ function solutionFromSeed(seed, difficulty) {
 /* --------------------------------- server ------------------------------- */
 
 const server = spawn(process.execPath, [join(root, 'server', 'server.js')], {
-  env: { ...process.env, PORT: String(PORT) },
+  env: {
+    ...process.env,
+    PORT: String(PORT),
+    // A short ring timeout keeps the unanswered-call test fast.
+    CALL_RING_TIMEOUT_MS: '2500',
+    // Exercise the TURN (HMAC) path: the shared secret must never reach a client.
+    TURN_URLS: 'turn:turn.test.invalid:3478?transport=udp',
+    TURN_STATIC_SECRET: 'test-turn-shared-secret',
+    TURN_TTL_SECONDS: '600',
+  },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stdout.on('data', (data) => process.env.VERBOSE && process.stdout.write(`[server] ${data}`));
@@ -661,6 +670,147 @@ try {
     assert.equal(invalid.code, 'INVALID_SETTINGS');
     c.close();
     d.close();
+  });
+
+  /* ----------------------------- voice calls ---------------------------- */
+
+  console.log('\nVOICE CALLS');
+
+  await test('call settings deliver STUN and ephemeral TURN credentials without leaking the secret', async () => {
+    const { a, b } = await startRacePair('vc-cfg-a', 'vc-cfg-b');
+    a.clear();
+    a.send({ type: MP.CALL_CONFIG });
+    const config = await a.waitFor(MP.CALL_CONFIG);
+    assert.ok(Array.isArray(config.iceServers) && config.iceServers.length >= 1);
+    const stun = config.iceServers.find((entry) => JSON.stringify(entry.urls).includes('stun:'));
+    assert.ok(stun, 'a STUN server is provided');
+    const turn = config.iceServers.find((entry) => JSON.stringify(entry.urls).includes('turn:'));
+    assert.ok(turn, 'a TURN server is provided when configured');
+    assert.match(turn.username, /^\d+:/, 'the TURN username is expiry-scoped');
+    assert.ok(typeof turn.credential === 'string' && turn.credential.length > 0);
+    assert.notEqual(turn.credential, 'test-turn-shared-secret');
+    assert.ok(
+      !JSON.stringify(config).includes('test-turn-shared-secret'),
+      'the TURN shared secret is never sent to the client',
+    );
+    a.close();
+    b.close();
+  });
+
+  await test('a call can be invited, accepted, signalled and ended', async () => {
+    const { a, b, code } = await startRacePair('vc-run-a', 'vc-run-b');
+    a.clear();
+    b.clear();
+    a.send({ type: MP.CALL_INVITE, roomId: code });
+    const incoming = await b.waitFor(MP.CALL_INCOMING);
+    assert.equal(incoming.from.id, 'vc-run-a');
+    const ringing = await a.waitFor(MP.CALL_STATE);
+    assert.equal(ringing.state, 'ringing');
+    assert.equal(ringing.role, 'caller');
+
+    b.send({ type: MP.CALL_ACCEPT, roomId: code });
+    const accepted = await a.waitFor(MP.CALL_ACCEPTED);
+    assert.equal(accepted.from.id, 'vc-run-b');
+    const active = await b.waitFor(MP.CALL_STATE, { predicate: (message) => message.state === 'active' });
+    assert.equal(active.role, 'callee');
+
+    // Opaque SDP is relayed verbatim to the opponent only (never echoed).
+    a.clear();
+    a.send({ type: MP.CALL_SIGNAL, roomId: code, signal: { type: 'offer', sdp: { type: 'offer', sdp: 'v=0-test' } } });
+    const relayed = await b.waitFor(MP.CALL_SIGNAL);
+    assert.equal(relayed.signal.sdp.sdp, 'v=0-test');
+    assert.equal(relayed.from.id, 'vc-run-a');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(a.messages.filter((message) => message.type === MP.CALL_SIGNAL).length, 0, 'signals are not echoed');
+
+    a.send({ type: MP.CALL_END, roomId: code, reason: 'ended' });
+    const endedA = await a.waitFor(MP.CALL_ENDED);
+    const endedB = await b.waitFor(MP.CALL_ENDED);
+    assert.equal(endedA.endedBy, 'vc-run-a');
+    assert.equal(endedB.reason, 'ended');
+    a.close();
+    b.close();
+  });
+
+  await test('busy and invalid call states are enforced', async () => {
+    const { a, b, code } = await startRacePair('vc-dec-a', 'vc-dec-b');
+    a.clear();
+    b.clear();
+    a.send({ type: MP.CALL_INVITE, roomId: code });
+    await b.waitFor(MP.CALL_INCOMING);
+    // A second invite while a call is ringing is refused.
+    a.send({ type: MP.CALL_INVITE, roomId: code });
+    const busy = await a.waitFor(MP.ERROR, { predicate: (message) => message.code === 'CALL_BUSY' });
+    assert.equal(busy.code, 'CALL_BUSY');
+    // The callee declines, releasing the room.
+    b.send({ type: MP.CALL_DECLINE, roomId: code });
+    const declined = await a.waitFor(MP.CALL_DECLINED);
+    assert.equal(declined.from.id, 'vc-dec-b');
+    // Accepting when nothing is ringing is invalid.
+    b.clear();
+    b.send({ type: MP.CALL_ACCEPT, roomId: code });
+    const invalid = await b.waitFor(MP.ERROR, { predicate: (message) => message.code === 'CALL_INVALID_STATE' });
+    assert.equal(invalid.code, 'CALL_INVALID_STATE');
+    a.close();
+    b.close();
+  });
+
+  await test('an unanswered call times out and is cleared for both players', async () => {
+    const { a, b, code } = await startRacePair('vc-time-a', 'vc-time-b');
+    a.clear();
+    b.clear();
+    a.send({ type: MP.CALL_INVITE, roomId: code });
+    await b.waitFor(MP.CALL_INCOMING);
+    const endedA = await a.waitFor(MP.CALL_ENDED, { timeout: 6000 });
+    const endedB = await b.waitFor(MP.CALL_ENDED, { timeout: 6000 });
+    assert.equal(endedA.reason, 'no-answer');
+    assert.equal(endedB.reason, 'no-answer');
+    a.close();
+    b.close();
+  });
+
+  await test('a disconnected player ends the call for the opponent', async () => {
+    const { a, b, code } = await startRacePair('vc-drop-a', 'vc-drop-b');
+    a.clear();
+    b.clear();
+    a.send({ type: MP.CALL_INVITE, roomId: code });
+    await b.waitFor(MP.CALL_INCOMING);
+    b.send({ type: MP.CALL_ACCEPT, roomId: code });
+    await a.waitFor(MP.CALL_ACCEPTED);
+    b.close();
+    const ended = await a.waitFor(MP.CALL_ENDED, { timeout: 6000 });
+    assert.equal(ended.reason, 'peer-disconnected');
+    a.close();
+  });
+
+  await test('outsiders cannot accept, end or signal another room\'s call', async () => {
+    const { a, b, code } = await startRacePair('vc-out-a', 'vc-out-b');
+    const outsider = makeClient('vc-outsider', 'Outsider');
+    await outsider.connect();
+    outsider.send({ type: MP.CREATE_ROOM, name: 'Outsider', difficulty: 'easy' });
+    await outsider.waitFor(MP.ROOM_CREATED);
+    outsider.clear();
+    outsider.send({ type: MP.CALL_ACCEPT, roomId: code });
+    const invalid = await outsider.waitFor(MP.ERROR, { predicate: (message) => message.code === 'CALL_INVALID_STATE' });
+    assert.equal(invalid.code, 'CALL_INVALID_STATE');
+    outsider.close();
+
+    // A rogue socket cannot inject signaling into an active call it is not in.
+    a.clear();
+    b.clear();
+    a.send({ type: MP.CALL_INVITE, roomId: code });
+    await b.waitFor(MP.CALL_INCOMING);
+    const rogue = makeClient('vc-rogue', 'Rogue');
+    await rogue.connect();
+    rogue.send({ type: MP.CALL_SIGNAL, roomId: code, signal: { type: 'offer', sdp: { sdp: 'rogue' } } });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(a.messages.filter((message) => message.type === MP.CALL_SIGNAL).length, 0);
+    assert.equal(b.messages.filter((message) => message.type === MP.CALL_SIGNAL).length, 0);
+    rogue.close();
+    b.send({ type: MP.CALL_DECLINE, roomId: code });
+    await a.waitFor(MP.CALL_DECLINED);
+    a.close();
+    b.close();
   });
 
   /* --------------------------- disconnections --------------------------- */

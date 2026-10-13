@@ -596,6 +596,8 @@ select {
     grid-template-columns: minmax(0, 1fr) clamp(260px, 30vw, 340px);
     grid-template-areas:
       "header     chat"
+      "tools      chat"
+      "voice      chat"
       "flash      chat"
       "toasts     chat"
       "hud        chat"
@@ -615,6 +617,12 @@ select {
   }
   .screen-game.mp-active .chat-toasts {
     grid-area: toasts;
+  }
+  .screen-game.mp-active .mp-tools {
+    grid-area: tools;
+  }
+  .screen-game.mp-active #voice-panel {
+    grid-area: voice;
   }
   .screen-game.mp-active .mp-hud {
     grid-area: hud;
@@ -1362,6 +1370,122 @@ select {
 @media (max-width: 759px) {
   .chat-panel {
     display: none !important;
+  }
+}
+
+/* ------------------------------------------- multiplayer tools + voice */
+
+.mp-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tool-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0.5rem 0.85rem;
+  min-height: 42px;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.tool-btn:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-color: var(--accent);
+}
+
+.tool-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tool-icon {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.mp-tools .chat-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+}
+
+.voice-panel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
+.voice-panel[data-state='connected'] {
+  border-color: var(--success);
+}
+
+.voice-panel[data-state='reconnecting'] {
+  border-color: var(--warning);
+}
+
+.voice-peer {
+  font-weight: 700;
+  font-size: 0.82rem;
+  max-width: 40vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-status {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.voice-muted,
+.voice-remote-muted {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--warning);
+}
+
+.call-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(4px);
+  z-index: 30;
+}
+
+.call-overlay-text {
+  margin: 0;
+  color: var(--text-dim);
+}
+
+/* Compact tool labels on narrow phones: icon-only buttons stay tappable. */
+@media (max-width: 520px) {
+  .tool-btn .tool-label {
+    display: none;
+  }
+
+  .tool-btn {
+    padding: 0.5rem 0.7rem;
   }
 }
 
