@@ -1295,13 +1295,22 @@ select {
   border-top: 1px solid var(--line);
   border-radius: 18px 18px 0 0;
   box-shadow: 0 -12px 30px rgba(0, 0, 0, 0.4);
-  /* dvh tracks the mobile browser chrome and the on-screen keyboard
-     (interactive-widget=resizes-content), so the input row stays visible. */
-  height: min(72dvh, 580px);
-  max-height: 78dvh;
+  /*
+   * Height is set by JavaScript (visualViewport.height) so the panel shrinks
+   * when the on-screen keyboard opens. The CSS below is a fallback for
+   * browsers that do not fire visualViewport resize promptly.
+   *
+   * interactive-widget=resizes-content (set on the viewport meta tag) tells
+   * the browser to resize the layout viewport when the keyboard opens, which
+   * makes 100vh track the available space on most modern browsers.
+   */
+  height: 100vh;
+  max-height: 100vh;
   display: flex;
   flex-direction: column;
   overscroll-behavior: contain;
+  /* Smoothly animate height changes when the keyboard opens/closes. */
+  transition: height 120ms ease, max-height 120ms ease;
 }
 
 .chat-mobile-head {
@@ -1343,6 +1352,10 @@ select {
   padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
   align-items: stretch;
+  flex: 0 0 auto;
+  /* Make sure the input row is not obscured by the keyboard in any
+     resize transition. */
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .chat-mobile-input {

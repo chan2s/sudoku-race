@@ -23,6 +23,9 @@ export class ChatUI {
     this.mobileOpen = false;
     this.unsubs = [];
     this.domBound = false;
+    this.visualViewportBound = false;
+    this._visualViewport = null;
+    this._lastViewportHeight = undefined;
     // Per-container scroll bookkeeping: { stuck, cueCount, count, cue }
     this.scrollState = new WeakMap();
   }
@@ -42,6 +45,7 @@ export class ChatUI {
       ];
     }
     this.bindDom();
+    this.bindVisualViewport();
     this.applyStatus(this.chat?.status ?? CHAT_STATUS.noRoom);
     this.applyUnread(this.chat?.unreadCount ?? 0);
     this.applyMessages(this.chat?.messages ?? []);
@@ -49,9 +53,124 @@ export class ChatUI {
   }
 
   detachChat() {
+    this.detachVisualViewport();
     for (const off of this.unsubs.splice(0)) off?.();
     this.chat = null;
   }
+
+  /**
+   * The Visual Viewport API fires when the on-screen keyboard opens or closes
+   * on mobile. We use it to keep the chat input row visible and to scroll new
+   * messages into view.
+   *
+   * Browsers that do not expose visualViewport (some desktop contexts) fall
+   * back to window resize / orientationchange, which is good enough there.
+   */
+  bindVisualViewport() {
+    this.detachVisualViewport();
+    if (typeof window === 'undefined' || !window.visualViewport) {
+      this.visualViewportBound = false;
+      return;
+    }
+    this.visualViewportBound = true;
+    const vp = window.visualViewport;
+    this._visualViewport = vp;
+    vp.addEventListener('resize', this.onVisualViewportChange);
+    vp.addEventListener('scroll', this.onVisualViewportChange);
+    window.addEventListener('resize', this.onVisualViewportChange);
+    window.addEventListener('orientationchange', this.onVisualViewportChange);
+    this.onVisualViewportChange();
+  }
+
+  detachVisualViewport() {
+    if (!this.visualViewportBound) return;
+    this.visualViewportBound = false;
+    const vp = this._visualViewport;
+    if (vp) {
+      vp.removeEventListener('resize', this.onVisualViewportChange);
+      vp.removeEventListener('scroll', this.onVisualViewportChange);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('resize', this.onVisualViewportChange);
+      window.removeEventListener('orientationchange', this.onVisualViewportChange);
+    }
+    this._visualViewport = null;
+  }
+
+  /**
+   * Called on visualViewport resize / scroll and on window resize /
+   * orientationchange.
+   *
+   * - Keep the mobile chat panel sized to the visual viewport so the input
+   *   row stays above the keyboard.
+   * - Scroll the message list to the bottom when the viewport height changes
+   *   by more than a small threshold (keyboard open / close), but only if the
+   *   user was already near the bottom.
+   */
+  onVisualViewportChange = () => {
+    if (typeof window === 'undefined' || !window.visualViewport) {
+      this.adjustPanelForViewport();
+      return;
+    }
+    this.adjustPanelForViewport();
+    this.maybeScrollToBottomOnViewportChange();
+  };
+
+  /**
+   * Sizes the mobile chat panel to the visual viewport height (minus a small
+   * margin) so the input row is never covered by the on-screen keyboard.
+   *
+   * Uses visualViewport.height when available (it accounts for the keyboard),
+   * falling back to window.innerHeight. On browsers whose CSS vh units do not
+   * update promptly when the keyboard opens, this is the primary mechanism.
+   */
+  adjustPanelForViewport() {
+    const panel = this.elements.chatMobilePanel;
+    if (!panel || panel.hidden) return;
+    const vp = window.visualViewport;
+    const viewportHeight = vp ? vp.height : window.innerHeight;
+    if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return;
+    const margin = 8;
+    const targetHeight = viewportHeight - margin;
+    const current = panel.offsetHeight;
+    if (Math.abs(current - targetHeight) > 2) {
+      panel.style.height = `${targetHeight}px`;
+      panel.style.maxHeight = `${targetHeight}px`;
+    }
+  }
+
+  /**
+   * When the keyboard opens or closes, the viewport height changes abruptly.
+   * If the user was already scrolled to the bottom, scroll them to the new
+   * bottom so the latest messages remain visible.
+   */
+  maybeScrollToBottomOnViewportChange() {
+    if (typeof window === 'undefined' || !window.visualViewport) return;
+    const vp = window.visualViewport;
+    const currentHeight = vp.height;
+    const prevHeight = this._lastViewportHeight;
+    this._lastViewportHeight = currentHeight;
+    if (prevHeight === undefined) return;
+    const delta = Math.abs(currentHeight - prevHeight);
+    if (delta < 48) return;
+    const messagesEl = this.elements.chatMobileMessages;
+    if (!messagesEl) return;
+    if (this.isNearBottom(messagesEl, 80)) {
+      requestAnimationFrame(() => this.scrollToBottom(messagesEl));
+    }
+  };
+
+  /**
+   * Scroll the mobile message list to the bottom when a new message arrives,
+   * but only if the user is already near the bottom.
+   */
+  scrollToBottomOnNewMessage() {
+    const messagesEl = this.elements.chatMobileMessages;
+    if (!messagesEl) return;
+    if (this.isNearBottom(messagesEl, 48)) {
+      requestAnimationFrame(() => this.scrollToBottom(messagesEl));
+    }
+  };
 
   /** DOM wiring happens once; handlers tolerate a missing chat client. */
   bindDom() {
@@ -111,6 +230,9 @@ export class ChatUI {
   applyMessages(messages) {
     this.renderContainer(this.elements.chatMessages);
     this.renderContainer(this.elements.chatMobileMessages);
+    // When new messages arrive while the mobile sheet is open, scroll to keep
+    // the latest visible if the user was already near the bottom.
+    this.scrollToBottomOnNewMessage();
   }
 
   renderContainer(container) {
@@ -241,7 +363,12 @@ export class ChatUI {
     this.updateSendButtons();
     this.renderContainer(this.elements.chatMobileMessages);
     this.ui?.announce('Chat opened');
-    requestAnimationFrame(() => this.elements.chatMobileInput?.focus());
+    // Defer focus and viewport adjustment so the browser has laid out the
+    // panel first; this avoids scroll jitter when the keyboard opens.
+    requestAnimationFrame(() => {
+      this.elements.chatMobileInput?.focus();
+      this.adjustPanelForViewport();
+    });
   }
 
   closeMobileChat() {
@@ -249,6 +376,10 @@ export class ChatUI {
     if (!panel || !this.mobileOpen) return;
     this.mobileOpen = false;
     panel.hidden = true;
+    // Reset any inline height/maxHeight so the CSS (dvh-based) takes over
+    // again when the panel is next shown.
+    panel.style.height = '';
+    panel.style.maxHeight = '';
     this.elements.chatMobileInput?.blur();
     this.updateSendButtons();
     this.ui?.announce('Chat closed');
